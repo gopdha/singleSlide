@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "ado": {
+      "command": "npx",
+      "args": ["-y", "@azure-devops/mcp", "<YOUR_ADO_ORG_NAME>", "--authentication", "pat"],
+      "env": {
+        "PERSONAL_ACCESS_TOKEN": "<PASTE_BASE64_ENCODED_VALUE_FROM_encode-pat.js>"
+      }
+    }
+  }
+}

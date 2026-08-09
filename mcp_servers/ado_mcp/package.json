@@ -1,0 +1,17 @@
+{
+  "name": "ado-mcp",
+  "version": "1.0.0",
+  "description": "Official Microsoft Azure DevOps MCP server setup + smoke test for the AI Weekly Leadership Report pipeline",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "test": "node smoke-test.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@azure-devops/mcp": "^2.9.0",
+    "@modelcontextprotocol/sdk": "^1.30.0"
+  }
+}

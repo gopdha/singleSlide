@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+venv/
+.venv/
+
+# Node (mcp_servers/ado_mcp)
+node_modules/
+
+# Credentials — config.json and .env files may hold real PATs/API keys.
+# The project's stated pattern is .env + python-dotenv; config.json is the
+# other place a real credential could accidentally land.
+config.json
+*.env
+.env.*
+
+# Test fixture artifacts (built by test_*.py / test_local.py at run time —
+# real submitted status reports live outside the repo, passed via
+# STATUS_REPORTS_DIR, never committed here)
+*.pptx
+
+# OS cruft
+.DS_Store
+Thumbs.db
