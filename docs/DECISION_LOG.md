@@ -263,3 +263,40 @@ This schema doesn't foreclose adding it later (a nullable `pm_edits JSONB`
 column on `weekly_reports` would be a non-breaking addition whenever that's
 decided) — its absence now is the same deliberate deferral as the Backlog
 entry, not a gap discovered late.
+
+## `core/rag_rollup.py` — the "Unknown" status, and a correction on its provenance
+Requirement 10's rule (any Blocked → Red, else any At Risk → Amber, else
+Green) leaves two related cases underspecified: zero Features investigated
+that week, and every investigated Feature landing on `Needs Human Review`
+(none Blocked/At Risk/On Track). Naively falling through to `Green` in
+either case would be dishonest — `Green` should mean "evaluated and found
+fine," not "nothing to evaluate" or "nothing could be confidently
+evaluated." Resolved by collapsing both into one rule rather than two
+special cases: `Unknown` fires exactly when there is no confidently-labeled
+Feature at all (empty list, or every Feature is `Needs Human Review`) — a
+`Blocked`/`At Risk`/`On Track` list of any size, even mixed with some
+`Needs Human Review` items, still resolves normally, since real evaluated
+signal exists. Same justification that motivated `Needs Human Review`
+existing in the taxonomy in the first place, applied one layer up.
+
+**Correction on provenance, for the record:** this was first proposed by
+citing "the original design's 'Unknown' status for missing data" as repo
+precedent. That precedent does not exist in this repo's documented
+history — there is no earlier `DECISION_LOG.md` entry, and no prior
+version of this file, that specifies an `Unknown` value. The actual source
+was a broader pre-repo design conversation about a *differently-structured*
+RAG engine (the old `rag-rules-engine`, which rolled up raw schedule/budget
+metrics, not agent-produced status labels) — the concept existed there,
+informally, but was never written into this repo. The `Unknown` value
+adopted here is a fresh decision for `core/rag_rollup.py`, independently
+justified by the reasoning above, not a continuation of documented
+history — it only happens to rhyme with an idea from that earlier,
+structurally unrelated design.
+
+`total_features` is included in the result as a deliberate diagnostic
+field — it lets a caller (Synthesis Agent, eventually) distinguish "0
+Features were Committed this week" from "N Features were investigated but
+all were Needs Human Review" even though both currently resolve to the
+same `Unknown` rag_status. Nothing reads this field yet; it's there so
+that distinction doesn't have to be re-derived later from data the
+function otherwise wouldn't expose.

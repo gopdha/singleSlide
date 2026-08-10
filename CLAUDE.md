@@ -150,8 +150,8 @@ docs/           this file + DECISION_LOG.md + BACKLOG.md
 | `agents/feature_agent` | ✅ **Done, fully live-verified** against a real ADO org and real Anthropic API — see "Known gotchas" below for 3 real bugs found and fixed during this |
 | `agents/status_report_agent` | ✅ **Done, fully live-verified** against a real Anthropic API and a real fixture report (exercised both Other-Initiative identification and enrichment-flagging, both `match_confidence` values) — see "Known gotchas" below for 2 real bugs found and fixed during this |
 | `archive/` | ✅ **Done, fully live-verified** against a real Neon Postgres — schema, migration, and all 5 tools exercised over the real MCP protocol (upsert idempotency, the approved-only prior-week filter, approval-reset-on-resave, wholesale snapshot replacement). No new gotchas found — the `mcp` package API was pre-verified against gotcha #9 before writing `server.py`, rather than discovered the hard way |
-| `core/rag_rollup.py` | ⬜ Not started — **next up** (old `rag-rules-engine` used raw metrics — this version rolls up Feature status *labels* instead, different logic) |
-| `agents/synthesis_agent` | ⬜ Not started (must handle: prior-week fetch, cross-report initiative dedup, overflow curation with risk-floor rule, narrative writing) |
+| `core/rag_rollup.py` | ✅ **Done, fully tested** — pure function, 13 unit tests covering the severity ordering, the collapsed Unknown edge case (empty list vs. all-Needs-Human-Review), Green-with-mixed-NHR, and loud failure on malformed input. No credentials needed, no tiering |
+| `agents/synthesis_agent` | ⬜ Not started — **next up** (must handle: prior-week fetch, cross-report initiative dedup, overflow curation with risk-floor rule, narrative writing) |
 | `agents/critique_agent` | ⬜ Not started |
 | `agents/slide_generation_agent` | ⬜ Not started (Skills-based, 3 slides, bounded auto-fit) |
 | `core/orchestrator.py` | ⬜ Not started |
