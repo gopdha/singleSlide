@@ -189,3 +189,77 @@ version-drift break in `ppt_mcp`'s `FastMCP` import (a previously
 failure mode where that break surfaced as `error_max_turns` — indistinguishable
 at first glance from a real turn-budget problem, until traced with full
 message-stream debugging.
+
+## Archive schema design decisions (project_id identity, prior-week filtering, approval reset, evidence typing)
+Four judgment calls made while designing `archive/`'s Postgres schema and
+tool signatures, resolved before any implementation was written:
+
+**`project_id` is a required, caller-supplied parameter on `ensure_project`,
+not derived from `name`.** Considered deriving it by slugifying `name` (with
+an optional override param for safety). Rejected the derive-by-default
+approach: `project_id` is already the first-class identifier everywhere else
+in this repo (`skills/<project_id>/...`, every agent's `project_id: str`
+parameter) — making Archive the one place it's *inferred* rather than
+*supplied* would introduce a second, weaker identifier path (slugification
+collisions between differently-named projects silently overwriting each
+other's `input_config`) for no real benefit, since every real caller
+(Discovery Agent, the Orchestrator) already knows the exact slug it's
+working with.
+
+**`get_prior_week_report` filters to `pm_approved_at IS NOT NULL`, not
+latest-saved.** Considered returning the latest row by `week_of` regardless
+of approval state. Rejected: Review Gate can save content that a PM then
+edits or rejects, and Synthesis Agent's continuity narrative ("up from At
+Risk last week") would be citing a draft the PM never actually approved if
+the filter didn't exclude it. Returns null both on a true first run and on
+"reports exist but none are approved yet" — both cases mean the same thing
+to a caller asking "what was the last approved state."
+
+**`pm_approved_at` resets to `NULL` on re-save of an already-approved
+week.** If `save_report_snapshot` is called again for a `week_of` that
+already has an approval timestamp (a rerun), new content shouldn't inherit
+approval that was granted for different content — stale approval attached
+to changed data would defeat the point of Review Gate being mandatory.
+
+**`evidence` columns are `TEXT[]`, not `JSONB`.** Every other flexible field
+(`input_config`, `profile`, `curated_features`, `curated_initiatives`) stays
+`JSONB` because their shape is genuinely open (owned by not-yet-built
+agents). `evidence` is different: both `feature_agent` and
+`status_report_agent` already produce it as a flat array of strings, fixed
+by their own output schemas — a native typed array is the more accurate
+fit, not just a stylistic swap.
+
+## Archive schema — additional confirmed design choices
+Three more points confirmed as deliberate (not oversights) once the schema
+above was reviewed and approved:
+
+**`curated_features`/`curated_initiatives` (on `weekly_reports`) are
+deliberately separate from `feature_snapshots`/`initiative_snapshots`.**
+The snapshot tables are the full, uncondensed `investigate_feature()` /
+Other-Initiative output for every item investigated that week — the source
+of truth Synthesis Agent needs for prior-week continuity. `curated_*` is
+the final, ordered, possibly flex-bound-condensed subset that actually
+rendered on the slide (Requirement 15's auto-fit truncation can mean slide
+text differs from the full snapshot text). Collapsing these into one
+representation would either lose the full investigation record or force
+every prior-week lookup to reconstruct "what was condensed" from partial
+data — neither is acceptable.
+
+**No `template_id` foreign key anywhere in this schema, deliberately.**
+Slide templates are Skills (Requirement 17) — the locked template lives as
+a generated `SKILL.md` file under `skills/<project_id>/slide-generation-agent/`,
+the same skill/code boundary and lookup mechanism (keyed on `project_id`,
+via `skill_loader.py`) as `feature-agent` and `status-report-agent`. A
+template isn't report-instance data that needs relational versioning in
+Postgres — it's a per-project artifact on disk, exactly like the other two
+skills. Adding a `templates` table would duplicate that mechanism for no
+benefit.
+
+**`pm_edits` (what a PM changed at Review Gate) is intentionally not a
+column here.** This is Backlog item 2's "PM correction feedback loop" —
+already logged there as deferred, owner's call to build the core pipeline
+first and revisit once real usage shows whether it's worth the complexity.
+This schema doesn't foreclose adding it later (a nullable `pm_edits JSONB`
+column on `weekly_reports` would be a non-breaking addition whenever that's
+decided) — its absence now is the same deliberate deferral as the Backlog
+entry, not a gap discovered late.
