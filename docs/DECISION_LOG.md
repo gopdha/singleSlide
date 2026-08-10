@@ -340,3 +340,26 @@ Whether `trend_line` gets its own column then, or gets folded into
 `executive_summary`'s prose instead, is a decision for that point, not
 this one — deferred deliberately, not forgotten (same posture as the
 `pm_edits` deferral above).
+
+## Naming a recurring convention: verify mechanically-checkable claims in code, never trust the agent's self-report
+Three separate build sessions independently arrived at the same pattern:
+`curate_report`'s risk-floor check (Part B never trusted to enforce
+Requirement 12 itself — code re-derives and checks after the call),
+`critique_report`'s risk-floor *re-check* (re-run on every call, including
+after a revision, specifically because a revision could re-break what the
+first pass got right), and the `common/risk_floor.py` extraction itself
+(pulled out once a second, independent caller needed the identical logic
+— proof this wasn't a one-off, it's a shape the system keeps needing).
+Naming it explicitly rather than leaving it as three coincidences: **if a
+rubric criterion can be verified by code — an exact-match, a set
+membership, a count — it is verified by code, every time the opportunity
+exists to check it, not just on the first pass.** The model is never
+trusted to self-certify compliance with something code could confirm
+directly; agentic judgment is reserved for what genuinely requires it
+(tone, dedup, phrasing). This is the same principle behind the RAG rollup
+staying a pure function fed by agent-produced labels (see "Why the RAG
+rollup stays deterministic even though Feature status is agentic" above)
+— applied here one level down, to individual rubric checks rather than
+the whole report status. `critique_agent`'s code-enforced/skill-defined
+split is this convention's most explicit expression yet: the split itself
+*is* the enforcement of "verify what's verifiable, judge what's not."
