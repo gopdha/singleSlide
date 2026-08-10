@@ -68,3 +68,21 @@ responses (~25,000 tokens) to prevent context exhaustion in hierarchical
 systems. Not implemented anywhere yet. `get_batch` on a Feature with many
 children is the most likely place this becomes a real problem — currently
 untested at scale (our one live-verified Feature had exactly one child).
+
+## 9. `ado_feature_id` vs. `feature_id` naming inconsistency
+`archive/server.py`'s `get_prior_week_report` returns Feature snapshots
+keyed `ado_feature_id` (its own storage-column name), while every other
+component in the pipeline — `feature_agent`'s own output, Synthesis's
+`curated_features`, the current week's `features` list — uses `feature_id`
+for the same concept. Discovered while building `synthesis_agent`, which
+has to consume both the current week's data and `prior_week` from Archive
+side by side. Not fixed at the source: `archive/` is already shipped and
+live-verified, and renaming a column there now is a real (if small)
+migration, not a free rename. Worked around locally instead —
+`synthesis_agent.synthesize_report` normalizes `ado_feature_id` ->
+`feature_id` on `prior_week['features']` immediately after fetching it,
+before passing that data anywhere else. If a third component ever needs
+`prior_week` data directly (bypassing `synthesize_report`'s normalization),
+this inconsistency will bite again — worth fixing at the source
+(`archive/server.py` and `schema.sql`) if that happens, rather than adding
+a second normalization site.
