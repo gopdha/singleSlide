@@ -300,3 +300,43 @@ all were Needs Human Review" even though both currently resolve to the
 same `Unknown` rag_status. Nothing reads this field yet; it's there so
 that distinction doesn't have to be re-derived later from data the
 function otherwise wouldn't expose.
+
+## Synthesis Agent — three-way split, the risk floor extended to Needs Human Review, and `trend_line`'s storage deferred
+`agents/synthesis_agent` splits into three parts rather than the two
+originally sketched in "Why Slide 2/3 curation lives in Synthesis Agent,
+not a separate agent" above: Part A (`merge_feature_enrichments`,
+deterministic, no LLM — applies Status Report Agent's flagged
+`potential_enrichments` onto Feature evidence/risk), Part B
+(`curate_report`, agentic — cross-report Initiative dedup and
+continuity-aware overflow curation together, since both need the same
+full Feature/Initiative list plus `prior_week`), and Part C
+(`write_executive_summary`, agentic — pure prose from Part B's
+already-finalized output, no tool calls, no re-fetching). This is finer
+than "structured curation vs. prose generation" — Part A is pulled out
+specifically because it's genuinely reproducible (a `difflib.SequenceMatcher`
+overlap check, not a judgment call), and keeping it separate from Part B
+means the evidence-merge trail stays fully deterministic even though
+curation and prose-writing don't.
+
+**The risk floor (Requirement 12) extends to `Needs Human Review`, not
+just `Blocked`/`At Risk`.** The requirement's literal text only names
+Blocked and At Risk as never-trimmable. Extended NHR the same protection
+because the alternative — NHR features silently droppable from overflow —
+directly contradicts why NHR exists at all: it's supposed to get *more*
+visibility for its uncertainty, not less. `curate_report`'s post-call
+validation checks all three labels against `curated_features`, raising
+loudly (matching `rag_rollup`'s `ValueError` convention) if any are
+missing — not trusting the agent's adherence to the rule from prompting
+alone.
+
+**`trend_line` (Part C's short continuity callout vs. `prior_week`) has no
+column in `archive`'s `weekly_reports` table, and none is being added
+right now.** `synthesize_report` returns it as a plain key in its result
+dict — nothing persists it yet. Storage is deferred to `core/orchestrator.py`'s
+build, since that's the first component that will actually call
+`save_report_snapshot` (Synthesis's output still passes through Critique
+Agent's revision loop before anything is "finalized" enough to archive).
+Whether `trend_line` gets its own column then, or gets folded into
+`executive_summary`'s prose instead, is a decision for that point, not
+this one — deferred deliberately, not forgotten (same posture as the
+`pm_edits` deferral above).
