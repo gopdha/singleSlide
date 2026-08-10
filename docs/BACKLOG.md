@@ -86,3 +86,25 @@ before passing that data anywhere else. If a third component ever needs
 this inconsistency will bite again — worth fixing at the source
 (`archive/server.py` and `schema.sql`) if that happens, rather than adding
 a second normalization site.
+
+## 10. Critique Agent's grounding check: coverage-only, not citation-verification
+`critique_agent`'s `grounding_coverage` check (Option A, shipped) confirms
+every risk-floor-labeled curated Feature's title appears somewhere in
+`executive_summary` — a coverage check, not a hallucination check. It
+cannot catch Part C referencing a Feature or Initiative that isn't real;
+it can only catch a real one being silently dropped from the prose. True
+citation verification (Option B, considered and deferred) would have
+Part C self-report what it referenced — add `referenced_feature_ids:
+list[int]` and `referenced_initiative_titles: list[str]` to
+`synthesis_agent`'s `WRITE_SUMMARY_SCHEMA`, then have `critique_agent`
+verify each citation actually exists in `curated_features`/
+`curated_initiatives`. Meaningfully stronger (a precise, code-verifiable
+check instead of a fuzzy substring-in-prose proxy), but changes Part C's
+output contract and requires re-verifying Part C live — deferred to keep
+this build's blast radius on an already-shipped, live-verified component
+to the minimum (the risk-floor extraction and the `prior_week` addition),
+not because the stronger version isn't worth doing. As a cheap partial
+mitigation without touching the schema, Part C's system prompt was
+updated to instruct using Feature/Initiative titles verbatim at least
+once — reduces (doesn't eliminate) the coverage check's false-positive
+risk from paraphrased titles.

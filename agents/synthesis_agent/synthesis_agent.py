@@ -32,6 +32,7 @@ from claude_agent_sdk.types import ResultMessage
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "common"))
 from mcp_client import open_mcp_client  # noqa: E402
+from risk_floor import RISK_FLOOR_LABELS, check_risk_floor  # noqa: E402
 from skill_loader import load_skill  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "core"))
@@ -39,7 +40,6 @@ from rag_rollup import compute_rag_rollup  # noqa: E402
 
 ARCHIVE_SERVER_PATH = Path(__file__).parent.parent.parent / "archive" / "server.py"
 
-RISK_FLOOR_LABELS = {"Blocked", "At Risk", "Needs Human Review"}
 OVERLAP_THRESHOLD = 0.6
 
 
@@ -237,9 +237,7 @@ PRIOR WEEK (null if this is the first report for this project):
         model=model, max_turns=max_turns, caller_name="curate_report",
     )
 
-    must_appear = {f["feature_id"] for f in features if f["status_label"] in RISK_FLOOR_LABELS}
-    present = {f["feature_id"] for f in result["curated_features"]}
-    missing = must_appear - present
+    missing = check_risk_floor(features, result["curated_features"])
     if missing:
         raise RuntimeError(
             f"curate_report violated the risk floor (CLAUDE.md requirement #12, extended to "
@@ -282,6 +280,9 @@ not deciding what to include, only how to say it.
 - executive_summary: plain, direct, executive-appropriate language. Lead with the headline
   (overall status, the biggest risk if any) rather than burying it under preamble. Ground every
   claim in the curated data provided — never invent a number, name, or detail not already there.
+  When you reference a specific Feature or Initiative, use its exact title verbatim at least
+  once rather than only paraphrasing — downstream checks confirm important items were actually
+  covered by matching against these exact titles.
 - trend_line: one short sentence comparing this week to prior_week. If prior_week is null (first
   report for this project), return an empty string — do not apologize for or call attention to
   the lack of history.
@@ -438,4 +439,5 @@ async def synthesize_report(
         "curated_initiatives": curation["curated_initiatives"],
         "features": merged_features,
         "initiatives": curation["deduped_initiatives"],
+        "prior_week": prior_week,
     }

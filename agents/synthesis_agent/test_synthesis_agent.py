@@ -329,7 +329,7 @@ async def run_live_checks(database_url: str | None):
     print(json.dumps(report, indent=2))
 
     expected_keys = {"project_id", "week_of", "rag_status", "executive_summary", "trend_line",
-                      "curated_features", "curated_initiatives", "features", "initiatives"}
+                      "curated_features", "curated_initiatives", "features", "initiatives", "prior_week"}
     assert set(report.keys()) == expected_keys
     print(f"\nPASS  synthesize_report returned every expected key, end to end")
 
