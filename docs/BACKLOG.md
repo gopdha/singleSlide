@@ -108,3 +108,19 @@ mitigation without touching the schema, Part C's system prompt was
 updated to instruct using Feature/Initiative titles verbatim at least
 once — reduces (doesn't eliminate) the coverage check's false-positive
 risk from paraphrased titles.
+
+## 11. `MAX_REVISIONS = 1` may be too tight for critique's real rubric rigor
+Set at 1 (1 initial pass + 1 revision), justified against `DECISION_LOG.md`'s
+existing cost estimate ("2 critique cycles assumed"). `core/orchestrator.py`'s
+first genuine end-to-end live run landed `reviewed: False` at the cap —
+not from one persistent issue, but from a *different* legitimate
+skill-defined check failing on each attempt (jargon-adjacent ADO
+terminology on attempt 1, a filler paragraph and headline-burying on
+attempt 2, both real, both fixable, neither the same issue twice). One
+data point isn't a pattern, but it's a real signal that a 5-criterion
+rubric applied with genuine rigor may not reliably converge within a
+single revision. Revisit once more real runs establish whether this is
+typical — raising the cap trades cost (each cycle is 3 more real LLM
+calls) for a higher chance of a clean pass; the alternative is accepting
+that `reviewed: False` will be a normal, not-rare outcome that Review
+Gate (not yet built) needs to handle gracefully as routine, not exceptional.

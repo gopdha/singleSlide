@@ -32,8 +32,16 @@ CREATE TABLE IF NOT EXISTS weekly_reports (
     report_id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     project_id         TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
     week_of            DATE NOT NULL,
-    rag_status         TEXT NOT NULL CHECK (rag_status IN ('Red', 'Amber', 'Green')),
+    -- 'Unknown' added post-launch (see docs/DECISION_LOG.md, gotcha found during
+    -- core/orchestrator.py's live verification): archive/ shipped before
+    -- core/rag_rollup.py existed and added the 4th value; nothing caught the gap until
+    -- a real pipeline run actually produced Unknown. See the standalone ALTER below for
+    -- already-existing databases.
+    rag_status         TEXT NOT NULL CHECK (rag_status IN ('Red', 'Amber', 'Green', 'Unknown')),
     executive_summary  TEXT NOT NULL,
+    trend_line         TEXT NOT NULL DEFAULT '', -- Part C's short continuity callout vs.
+                                            -- prior_week; '' when there was no prior_week to
+                                            -- compare against (first report for the project)
     curated_features    JSONB NOT NULL,    -- final Feature Status slide content (ordered,
                                             -- possibly flex-bound-condensed display text)
     curated_initiatives JSONB NOT NULL,    -- same idea for Initiative Status slide
@@ -42,6 +50,22 @@ CREATE TABLE IF NOT EXISTS weekly_reports (
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (project_id, week_of)
 );
+
+-- weekly_reports existed before trend_line was added (see docs/DECISION_LOG.md, "trend_line
+-- storage resolution" under core/orchestrator.py) — CREATE TABLE IF NOT EXISTS above is a
+-- no-op against an already-existing table, so the column is added explicitly here too.
+-- Idempotent: safe to re-run against a fresh database where the table (and column) were
+-- just created above.
+ALTER TABLE weekly_reports ADD COLUMN IF NOT EXISTS trend_line TEXT NOT NULL DEFAULT '';
+
+-- Same situation as trend_line above: the original CHECK constraint was written for
+-- Requirement 10's literal 3-value rule, before rag_rollup.py's 'Unknown' existed.
+-- Postgres has no "ADD CONSTRAINT IF NOT EXISTS" — DROP-then-ADD is the idempotent
+-- equivalent (safe to re-run; ends in the same state either way). Constraint name is
+-- Postgres's own auto-generated default (<table>_<column>_check) for an inline CHECK.
+ALTER TABLE weekly_reports DROP CONSTRAINT IF EXISTS weekly_reports_rag_status_check;
+ALTER TABLE weekly_reports ADD CONSTRAINT weekly_reports_rag_status_check
+    CHECK (rag_status IN ('Red', 'Amber', 'Green', 'Unknown'));
 
 CREATE TABLE IF NOT EXISTS feature_snapshots (
     snapshot_id        BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

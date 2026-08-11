@@ -19,8 +19,14 @@ projects (project_id PK, caller-supplied)
                   └── 1:N ── initiative_snapshots (report_id FK)
 ```
 
-Full DDL in `schema.sql`. Three things worth knowing before touching this schema:
+Full DDL in `schema.sql`. Four things worth knowing before touching this schema:
 
+- **`weekly_reports.trend_line`** (added post-launch, via `core/orchestrator.py`'s build —
+  see `docs/DECISION_LOG.md`) holds Synthesis Part C's short continuity callout vs. the
+  prior week. `NOT NULL DEFAULT ''` — empty string, not null, when there was no prior
+  week to compare against. `schema.sql` has both the `CREATE TABLE` column and a
+  standalone idempotent `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, since the table
+  already existed in deployed databases before this column did.
 - **`feature_snapshots`/`initiative_snapshots` vs. `curated_features`/`curated_initiatives`
   are deliberately different things.** The snapshot tables hold every Feature/Initiative
   investigated that week, full detail — what `get_prior_week_report` needs for continuity.

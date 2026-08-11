@@ -363,3 +363,48 @@ rollup stays deterministic even though Feature status is agentic" above)
 the whole report status. `critique_agent`'s code-enforced/skill-defined
 split is this convention's most explicit expression yet: the split itself
 *is* the enforcement of "verify what's verifiable, judge what's not."
+
+## `core/orchestrator.py` — a code-enforced check failing after independent re-verification is a bug, not a content judgment call
+Discovered while tracing the pipeline end to end: `curate_report` already
+validates the risk floor internally on every call, including revisions,
+and raises before ever returning. That means if `synthesize_report`
+returns successfully at all, the floor is structurally guaranteed to
+already hold by the time `critique_report` independently re-checks the
+same thing. So `critique_report` failing specifically on `risk_floor` in
+a real pipeline run (as opposed to a hand-crafted test report) can only
+mean `curate_report`'s and `critique_report`'s two independent
+implementations of the same check disagree — a real bug in the code, not
+normal variance in subjective judgment the way a failed tone or
+conciseness check would be.
+
+Named as an explicit, general convention, not a one-off for this one
+check: **when a code-enforced check fails after having already been
+independently verified earlier in the same pipeline run, that is a bug
+signal, not a content-quality signal, and must hard-stop the run before
+persistence** — not get flagged and passed through to a human reviewer
+the way a failed skill-defined (or first-time-checked code-enforced)
+criterion does. The report's trustworthiness is unknown at that point;
+`archive.save_report_snapshot` must never be called on it. This is a
+direct extension of "verify mechanically-checkable claims in code, never
+trust the agent's self-report" (above): the corollary is that when two
+independent code-level verifications of the *same* claim disagree, that
+disagreement itself is the loudest possible signal something is wrong,
+and the system must fail loudly rather than let a human quietly inherit
+an unexplained inconsistency.
+
+## Real bugs found during core/orchestrator.py's live verification
+In `CLAUDE.md`'s "Known gotchas" (items 11-12), same reasoning as every
+other component's live-verification bugs: a cross-component contract gap
+(`archive`'s `rag_status` `CHECK` constraint never learned about
+`rag_rollup.py`'s `Unknown` value, since the two components shipped at
+different times and no prior test happened to exercise that value), and a
+real internal-error-string leak that traveled two full hops downstream
+into executive-facing prose before `critique_agent` caught it — fixed at
+the source (`merge_feature_enrichments` no longer spreads unknown Feature
+dict keys into Synthesis's prompts) plus a `FORBIDDEN_VOCABULARY_RULE`
+addition to both Part B and Part C's system prompts, since the same
+category of leak also showed up as the model's own word choice
+("rollup"), not just literal copying. Both found only because this was
+the first genuine end-to-end live run across real ADO, real Anthropic,
+and real Neon together — neither was reachable by any single component's
+own isolated live verification.
