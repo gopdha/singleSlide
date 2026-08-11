@@ -155,7 +155,7 @@ docs/           this file + DECISION_LOG.md + BACKLOG.md
 | `agents/critique_agent` | ✅ **Done, fully live-verified** against a real Anthropic API — a well-formed report (`passed: true`, all 2 code-enforced + 5 skill-defined checks passed) and a deliberately risk-floor-violating one (`passed: false`, driven by the real model path, not mocked) both confirmed. The violating case proved code-enforced and skill-defined checks are genuinely independent: `risk_floor` failed while all 5 skill-defined checks passed on their own merits (the prose itself was well-written even though the underlying data was broken) — `overall_feedback` correctly led with the code-enforced failure regardless |
 | `core/orchestrator.py` | ✅ **Done, fully live-verified end to end** — real ADO org, real Anthropic API, and real Neon Postgres together for the first time in this project, all 4 agents + Archive in one real `run_pipeline()` run, `report_id` persisted. Found and fixed 2 real cross-component bugs only a genuine end-to-end run could surface (see "Known gotchas" #11-12) — neither was reachable by any single component's own isolated live verification. Also 7/7 mocked control-flow tests covering all 4 revision-loop branches, and 2 real integration issues found by tracing actual signatures rather than assuming (`status_report_agent`'s `existing_features` shape, the `ensure_project`-before-`save_report_snapshot` FK requirement). Worth noting honestly: even after both fixes, the live run still ended `reviewed: False` — not a bug, but real evidence that a rigorous 5-criterion skill-defined rubric doesn't always converge within one revision; `MAX_REVISIONS` may be worth revisiting once more real runs establish a pattern, per Backlog's "revisit once real usage shows what matters" posture |
 | `agents/slide_generation_agent` | ⬜ Not started (Skills-based, 3 slides, bounded auto-fit) |
-| `agents/discovery_agent` | ⬜ Not started |
+| `agents/discovery_agent` | 🟨 **Implemented, tier-1 + scripted-conversation integration tests all pass** (22 checks: WIQL-sampling helpers, `default_ask_human`'s input validation, `_normalize_field_name`/`_resolve_field`/`_append_caveats`, and full happy-path/reject-retry-loop/cancel-path/field-name-normalization/caveat-guarantee conversations for both skills, real `write_skill`/`load_skill` round-tripping, zero credentials needed). Generates `feature-agent` and `status-report-agent` skills only — slide-template skill explicitly deferred (needs `slide_generation_agent`, not built). Architecturally new: a real PM conversation via a custom `ask_human` callable, not a one-shot structured call — `AskUserQuestion` investigated and deliberately rejected (see "Known gotchas" #13). **The first genuine live attempt already found and fixed two real bugs**: a free-text answer ("Tag" vs. the expected "Tags") crashed the run (#14, fixed with a deliberately narrow scope — only that one question became closed-choice, not a blanket conversion), and a PM's legitimate override of a failed sanity check left no trace in the persisted skill (#15, fixed with a deterministic caveat-guarantee, extending this project's "verify mechanically, never trust self-report" convention to free text). Live conversation not yet re-attempted since either fix — **needs the project owner to re-run it, not something this session can verify** |
 | `review_gate/` | ⬜ Not started |
 
 ## Known gotchas (learned the hard way — don't rediscover these)
@@ -255,6 +255,75 @@ docs/           this file + DECISION_LOG.md + BACKLOG.md
     everything through" dicts between a deterministic stage and an agentic
     one is a real injection path for internal implementation detail, not
     just a style nitpick.
+13. **`AskUserQuestion` (and the rest of the ambient Claude Code CLI tool
+    surface — `Bash`, `Edit`, `Write`, etc.) is technically reachable from
+    a `claude_agent_sdk.query()` call in this environment**, even when
+    `allowed_tools` doesn't list it — because `claude_agent_sdk` shells
+    out to a real Claude Code CLI installation on this machine, which
+    exposes its whole tool catalog as deferred tools regardless of the
+    allowlist. Confirmed directly from a captured `SystemMessage` during
+    gotcha #10's investigation (`'tools': ['Task', 'AskUserQuestion',
+    'Bash', ...]`). Considered using `AskUserQuestion` to drive Discovery
+    Agent's PM conversation natively inside an agentic loop — rejected:
+    reachability in the tool list doesn't prove it behaves correctly when
+    `query()` runs detached from an interactive session actually watching
+    for it, and that's the exact failure shape gotcha #10 already
+    documented (something that looks available but silently hangs or
+    fails with no clear diagnostic). Not worth betting Discovery Agent's
+    entire interaction model on an unverified assumption when a strictly
+    safer, directly-testable alternative existed (a custom `ask_human`
+    callable — see `agents/discovery_agent`). Different in kind from every
+    other gotcha above: investigated and avoided before writing any code,
+    not discovered broken after the fact — worth recording for that
+    reason alone.
+14. **A free-text question matched against a small closed dict is a real
+    crash risk, even when every individual answer is reasonable.** The
+    very first real interactive run of `agents/discovery_agent` crashed:
+    asked "a Tag, a State, or something else?", the PM reasonably typed
+    "Tag" (singular) — but `_FIELD_MAP` only recognized "Tags" (plural),
+    matched exactly, so it resolved to the nonexistent ADO field
+    `System.Tag`, sampled zero real values, and correctly refused to
+    proceed on nothing (the loud-failure design worked exactly as
+    intended — this was a real input-handling gap, not a validation
+    bug). Fixed two ways together, deliberately not just one: (1) that
+    specific question became a closed-choice prompt (`["Tag", "State",
+    "Something else"]`, with "Something else" triggering a free-text
+    follow-up) — chosen narrowly for *this one question*, not applied as
+    a blanket policy, because every other free-text question in the flow
+    either has no downstream exact-match logic at all (`child_types`,
+    `child_relation` — read only as prose by feature_agent's own agentic
+    loop) or already had a retry/sanity-check safety net (`work_item_type`
+    on a zero-sample result, `story_points_field` on an all-empty sample)
+    — converting those too would be solving a risk that doesn't exist
+    there. (2) `_normalize_field_name` normalizes case/plural variants of
+    the two well-known field names regardless of which path text arrives
+    by (the closed choice, or the "Something else" escape hatch), and —
+    critically — the *persisted* skill stores the canonical `"Tags"`, not
+    whatever the PM literally typed: `feature_agent.py`'s own
+    `_resolve_field` is exact-match too, so an unnormalized value in the
+    written skill would have silently broken every future weekly
+    `feature_agent` run for that project, not just this one Discovery
+    session.
+15. **A flagged-and-overridden sanity check is invisible if the override
+    doesn't survive into the one place a future reader would see it.**
+    Same live session as gotcha #14: the `story_points_field` sanity
+    check correctly fired (empty on every sample) and the PM correctly
+    chose to keep the value anyway (reasonable — only one real sample
+    existed) — but the persisted skill body stated the field as unhedged
+    fact, with no trace that it was ever flagged. The check ran, found
+    something real, and the PM's judgment call about it evaporated the
+    moment `run_feature_agent_discovery` returned. Fixed by collecting
+    such overrides into a `discovery_caveats` list, passed into the
+    body-drafting context (so the model *can* weave it in naturally), and
+    then — the part that actually matters — `_append_caveats`
+    deterministically guarantees every caveat lands in the persisted body
+    regardless of whether the drafting call included it, via a fixed
+    `## Discovery caveats` section. This is the same "verify
+    mechanically-checkable claims in code, never trust the agent's
+    self-report" convention (`docs/DECISION_LOG.md`), extended one step
+    further: not just validating a structured field the model returned,
+    but guaranteeing a specific piece of free text can't be silently
+    dropped from prose at all.
 
 ## Coding conventions established so far
 - Python throughout except `ado_mcp` (forced Node.js — no Python
