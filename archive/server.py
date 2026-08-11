@@ -101,7 +101,7 @@ async def get_prior_week_report_impl(project_id: str) -> Optional[dict[str, Any]
     async with pool.acquire() as conn:
         report_row = await conn.fetchrow(
             """
-            SELECT report_id, week_of, rag_status, executive_summary,
+            SELECT report_id, week_of, rag_status, executive_summary, trend_line,
                    curated_features, curated_initiatives, pm_approved_at
             FROM weekly_reports
             WHERE project_id = $1 AND pm_approved_at IS NOT NULL
@@ -139,6 +139,7 @@ async def get_prior_week_report_impl(project_id: str) -> Optional[dict[str, Any]
         "week_of": _iso(report_row["week_of"]),
         "rag_status": report_row["rag_status"],
         "executive_summary": report_row["executive_summary"],
+        "trend_line": report_row["trend_line"],
         "curated_features": report_row["curated_features"],
         "curated_initiatives": report_row["curated_initiatives"],
         "pm_approved_at": _iso(report_row["pm_approved_at"]),
@@ -185,12 +186,13 @@ async def save_report_snapshot_impl(project_id: str, report: dict[str, Any]) -> 
             report_row = await conn.fetchrow(
                 """
                 INSERT INTO weekly_reports
-                    (project_id, week_of, rag_status, executive_summary,
+                    (project_id, week_of, rag_status, executive_summary, trend_line,
                      curated_features, curated_initiatives, pm_approved_at)
-                VALUES ($1, $2, $3, $4, $5, $6, NULL)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, NULL)
                 ON CONFLICT (project_id, week_of) DO UPDATE
                     SET rag_status = EXCLUDED.rag_status,
                         executive_summary = EXCLUDED.executive_summary,
+                        trend_line = EXCLUDED.trend_line,
                         curated_features = EXCLUDED.curated_features,
                         curated_initiatives = EXCLUDED.curated_initiatives,
                         pm_approved_at = NULL
@@ -200,6 +202,7 @@ async def save_report_snapshot_impl(project_id: str, report: dict[str, Any]) -> 
                 date.fromisoformat(report["week_of"]),
                 report["rag_status"],
                 report["executive_summary"],
+                report["trend_line"],
                 report["curated_features"],
                 report["curated_initiatives"],
             )

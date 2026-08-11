@@ -149,12 +149,12 @@ docs/           this file + DECISION_LOG.md + BACKLOG.md
 | `mcp_servers/ado_mcp`, `mcp_servers/ppt_mcp` | ✅ Carried over, previously verified (`ppt_mcp` needed a real fix during Status Report Agent's live verification — see "Known gotchas" below) |
 | `agents/feature_agent` | ✅ **Done, fully live-verified** against a real ADO org and real Anthropic API — see "Known gotchas" below for 3 real bugs found and fixed during this |
 | `agents/status_report_agent` | ✅ **Done, fully live-verified** against a real Anthropic API and a real fixture report (exercised both Other-Initiative identification and enrichment-flagging, both `match_confidence` values) — see "Known gotchas" below for 2 real bugs found and fixed during this |
-| `archive/` | ✅ **Done, fully live-verified** against a real Neon Postgres — schema, migration, and all 5 tools exercised over the real MCP protocol (upsert idempotency, the approved-only prior-week filter, approval-reset-on-resave, wholesale snapshot replacement). No new gotchas found — the `mcp` package API was pre-verified against gotcha #9 before writing `server.py`, rather than discovered the hard way |
+| `archive/` | ✅ **Done, fully live-verified** against a real Neon Postgres — schema, migration, and all 5 tools exercised over the real MCP protocol (upsert idempotency, the approved-only prior-week filter, approval-reset-on-resave, wholesale snapshot replacement). Gained two post-launch additions during `core/orchestrator.py`'s build, each with an idempotent migration statement and a full suite re-verification after: a `trend_line` column, and a fix to `rag_status`'s `CHECK` constraint (it never included `Unknown` — see "Known gotchas" #11, a real gap only a genuine end-to-end live run surfaced) |
 | `core/rag_rollup.py` | ✅ **Done, fully tested** — pure function, 13 unit tests covering the severity ordering, the collapsed Unknown edge case (empty list vs. all-Needs-Human-Review), Green-with-mixed-NHR, and loud failure on malformed input. No credentials needed, no tiering |
-| `agents/synthesis_agent` | ✅ **Done, fully live-verified**, including a full re-verification after the `common/risk_floor.py` extraction and the `prior_week`-in-return-dict addition (both for `agents/critique_agent`) — no regressions. Against a real Anthropic API and real Neon Postgres: Part A's merge logic (regression-tested for a real overlap-dilution bug found during this build), Part B's risk floor (both a real live run honoring it AND a mocked-agent test proving the code-level safety net actually fires when violated), Part C's prose, and the full `synthesize_report` path confirmed to call `archive.get_prior_week_report` exactly once per run, not once per Part |
+| `agents/synthesis_agent` | ✅ **Done, fully live-verified**, including three full re-verifications after later touches — the `common/risk_floor.py` extraction + `prior_week`-in-return-dict addition (for `agents/critique_agent`), the `revision_feedback` threading through Parts B/C (for `core/orchestrator.py`), and the internal-error-string leak fix (`merge_feature_enrichments` no longer spreads unknown Feature keys + a `FORBIDDEN_VOCABULARY_RULE` on both Part B/C prompts — see "Known gotchas" #12) — no regressions any time. Against a real Anthropic API and real Neon Postgres: Part A's merge logic (regression-tested for a real overlap-dilution bug found during this build), Part B's risk floor (both a real live run honoring it AND a mocked-agent test proving the code-level safety net actually fires when violated), Part C's prose, and the full `synthesize_report` path confirmed to call `archive.get_prior_week_report` exactly once per run, not once per Part |
 | `agents/critique_agent` | ✅ **Done, fully live-verified** against a real Anthropic API — a well-formed report (`passed: true`, all 2 code-enforced + 5 skill-defined checks passed) and a deliberately risk-floor-violating one (`passed: false`, driven by the real model path, not mocked) both confirmed. The violating case proved code-enforced and skill-defined checks are genuinely independent: `risk_floor` failed while all 5 skill-defined checks passed on their own merits (the prose itself was well-written even though the underlying data was broken) — `overall_feedback` correctly led with the code-enforced failure regardless |
+| `core/orchestrator.py` | ✅ **Done, fully live-verified end to end** — real ADO org, real Anthropic API, and real Neon Postgres together for the first time in this project, all 4 agents + Archive in one real `run_pipeline()` run, `report_id` persisted. Found and fixed 2 real cross-component bugs only a genuine end-to-end run could surface (see "Known gotchas" #11-12) — neither was reachable by any single component's own isolated live verification. Also 7/7 mocked control-flow tests covering all 4 revision-loop branches, and 2 real integration issues found by tracing actual signatures rather than assuming (`status_report_agent`'s `existing_features` shape, the `ensure_project`-before-`save_report_snapshot` FK requirement). Worth noting honestly: even after both fixes, the live run still ended `reviewed: False` — not a bug, but real evidence that a rigorous 5-criterion skill-defined rubric doesn't always converge within one revision; `MAX_REVISIONS` may be worth revisiting once more real runs establish a pattern, per Backlog's "revisit once real usage shows what matters" posture |
 | `agents/slide_generation_agent` | ⬜ Not started (Skills-based, 3 slides, bounded auto-fit) |
-| `core/orchestrator.py` | ⬜ Not started |
 | `agents/discovery_agent` | ⬜ Not started |
 | `review_gate/` | ⬜ Not started |
 
@@ -219,6 +219,42 @@ docs/           this file + DECISION_LOG.md + BACKLOG.md
     standalone (`python3 server.py`) or connects via a direct
     `common/mcp_client.py` call — cost real time chasing the wrong fix here
     during Status Report Agent's live verification.
+11. **`archive`'s `weekly_reports.rag_status` `CHECK` constraint only allowed
+    `('Red', 'Amber', 'Green')`**, silently missing `Unknown` — because
+    `archive/` shipped before `core/rag_rollup.py` existed and added that
+    4th value. Every prior live test of `synthesis_agent`/`critique_agent`
+    used fixtures that guaranteed a Red/Amber/Green result, so nothing
+    caught the gap until `core/orchestrator.py`'s first genuine end-to-end
+    live run — a real Feature legitimately landed on `Needs Human Review`
+    (feature_agent hit `error_max_turns` investigating it), correctly
+    rolled up to `Unknown`, and `save_report_snapshot` failed on a
+    `CHECK` constraint violation at the very last step, after every
+    upstream stage had already succeeded. Fixed with a DROP+ADD
+    `CONSTRAINT` in `schema.sql` (Postgres has no `ADD CONSTRAINT IF NOT
+    EXISTS`) alongside the pattern already established for `trend_line`'s
+    `ADD COLUMN IF NOT EXISTS`. A reminder that a component being
+    "fully live-verified" only means verified against the scenarios its
+    own tests happened to exercise — a downstream component's later
+    addition (a new enum value, in this case) can silently invalidate an
+    earlier one's constraints with no test anywhere catching it until a
+    real run produces the untested value.
+12. **A raw internal error string can leak two full hops downstream into
+    executive-facing prose before anything catches it.** `feature_agent`'s
+    per-item failure path adds a real exception string (e.g. `"...
+    error_max_turns"`) under an `error` key on the Feature dict — reasonable
+    for operator visibility on `feature_agent`'s own output. But
+    `synthesis_agent.merge_feature_enrichments` used to spread `**feature`
+    when reconstructing its output, so that key rode along into Part B's
+    prompt, and the model (reasonably, given what it saw) wrote it straight
+    into `curated_features` and then `executive_summary`. `critique_agent`
+    caught it — but only after spending the pipeline's one allowed revision
+    on it. Fixed at the one place all Feature data funnels through before
+    reaching any LLM prompt: `merge_feature_enrichments` now reconstructs
+    its output from only the canonical `FEATURE_SCHEMA` fields, never a
+    `**feature` spread. Worth the general lesson: passing "just pass
+    everything through" dicts between a deterministic stage and an agentic
+    one is a real injection path for internal implementation detail, not
+    just a style nitpick.
 
 ## Coding conventions established so far
 - Python throughout except `ado_mcp` (forced Node.js — no Python

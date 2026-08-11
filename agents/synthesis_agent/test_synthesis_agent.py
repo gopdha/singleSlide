@@ -23,8 +23,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 import synthesis_agent as sa  # noqa: E402
 from synthesis_agent import (  # noqa: E402
     CURATE_REPORT_SCHEMA,
+    FORBIDDEN_VOCABULARY_RULE,
     RISK_FLOOR_LABELS,
     WRITE_SUMMARY_SCHEMA,
+    _format_revision_feedback,
     curate_report,
     merge_feature_enrichments,
     synthesize_report,
@@ -133,11 +135,36 @@ def run_part_a_tests():
     assert id(original_features[0]["evidence"]) == original_evidence_id
     print("  PASS  input features list and dicts are not mutated — a new list is returned")
 
-    # Extra fields pass through unchanged
+    # Canonical FEATURE_SCHEMA fields pass through unchanged
     features = [_feature(1, "On Track", ["comment A"], risk=None, short_description="A real description")]
     result = merge_feature_enrichments(features, [])
     assert result[0]["short_description"] == "A real description" and result[0]["title"] == "Feature 1"
-    print("  PASS  fields other than evidence/risk pass through unchanged")
+    print("  PASS  canonical FEATURE_SCHEMA fields other than evidence/risk pass through unchanged")
+
+    # Non-schema fields (e.g. feature_agent's per-item failure "error" key) are DROPPED,
+    # not passed through — a real live pipeline run showed a raw "error" string (containing
+    # "Feature Agent"/"error_max_turns") leaking into Part B's prompt and then into
+    # executive-facing prose, caught by critique but only after burning a revision on it.
+    features = [_feature(1, "Needs Human Review", [], risk=None,
+                          error="Feature Agent failed on work item #1: error_max_turns")]
+    result = merge_feature_enrichments(features, [])
+    assert "error" not in result[0], "non-schema fields (e.g. feature_agent's raw 'error' string) must not reach Synthesis prompts"
+    assert set(result[0].keys()) == {"feature_id", "title", "short_description", "status_label", "progress_summary", "risk", "evidence"}
+    print("  PASS  non-schema fields (e.g. feature_agent's raw 'error' string) are dropped, not passed through")
+
+
+def run_revision_feedback_tests():
+    print("\n_format_revision_feedback — pure unit tests (used by core/orchestrator.py's revision loop):")
+
+    assert _format_revision_feedback(None) == ""
+    assert _format_revision_feedback([]) == ""
+    print("  PASS  no feedback (None or empty) renders to an empty prompt block — a first pass looks identical to before this change")
+
+    feedback = [{"criterion": "risk_floor", "passed": False, "feedback": "feature_id(s) [205] missing"}]
+    block = _format_revision_feedback(feedback)
+    assert "PREVIOUS ATTEMPT FEEDBACK" in block
+    assert "risk_floor" in block and "205" in block
+    print("  PASS  non-empty feedback renders the full checks[] content into the prompt block")
 
 
 def run_structural_checks():
@@ -147,6 +174,11 @@ def run_structural_checks():
 
     assert RISK_FLOOR_LABELS == {"Blocked", "At Risk", "Needs Human Review"}
     print("  PASS  RISK_FLOOR_LABELS includes Needs Human Review (extended per docs/DECISION_LOG.md)")
+
+    for term in ("rollup", "Feature Agent", "turn budget"):
+        assert term in FORBIDDEN_VOCABULARY_RULE, f"FORBIDDEN_VOCABULARY_RULE must forbid '{term}'"
+    assert "{forbidden_vocabulary_rule}" in sa.CURATE_SYSTEM_PROMPT and "{forbidden_vocabulary_rule}" in sa.WRITE_SUMMARY_SYSTEM_PROMPT
+    print("  PASS  FORBIDDEN_VOCABULARY_RULE lists internal-mechanism terms and is wired into both Part B and Part C prompts")
 
     curated_feature_props = CURATE_REPORT_SCHEMA["properties"]["curated_features"]["items"]["properties"]
     assert curated_feature_props["status_label"]["enum"] == ["On Track", "At Risk", "Blocked", "Needs Human Review"]
@@ -342,6 +374,7 @@ async def run_live_checks(database_url: str | None):
 async def main():
     print("Synthesis Agent — test suite\n")
     run_part_a_tests()
+    run_revision_feedback_tests()
     run_structural_checks()
     await run_risk_floor_violation_test()  # no credentials needed — the agentic call is mocked
 

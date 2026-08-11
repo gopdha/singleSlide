@@ -48,6 +48,17 @@ def run_structural_checks():
     assert "TEXT[]" in schema_sql_no_comments, "evidence columns should be native TEXT[], not JSONB"
     print("  PASS  evidence columns use TEXT[] (not JSONB)")
 
+    assert "trend_line" in schema_sql_no_comments and "ADD COLUMN IF NOT EXISTS trend_line" in schema_sql_no_comments, \
+        "trend_line needs both the CREATE TABLE column and the idempotent ALTER for already-existing databases"
+    print("  PASS  schema.sql has trend_line on weekly_reports, with an idempotent ALTER for pre-existing databases")
+
+    assert "'Red', 'Amber', 'Green', 'Unknown'" in schema_sql_no_comments, \
+        "rag_status CHECK constraint must include Unknown (core/rag_rollup.py's 4th value) — found missing during " \
+        "core/orchestrator.py's live verification, a real gap between two components built at different times"
+    assert "DROP CONSTRAINT IF EXISTS weekly_reports_rag_status_check" in schema_sql_no_comments, \
+        "needs the idempotent DROP+ADD for already-existing databases with the old 3-value constraint"
+    print("  PASS  rag_status CHECK constraint includes Unknown, with an idempotent DROP+ADD for pre-existing databases")
+
     assert SERVER_PATH.exists()
     server_src = SERVER_PATH.read_text(encoding="utf-8")
     for tool in ("ensure_project", "get_prior_week_report", "save_report_snapshot",
@@ -117,6 +128,7 @@ async def run_live_checks(database_url: str):
                 "week_of": "2026-08-02",
                 "rag_status": "Amber",
                 "executive_summary": "Steady progress with one at-risk item.",
+                "trend_line": "",
                 "curated_features": [{"ado_feature_id": 101, "display_text": "On track", "status_label": "On Track"}],
                 "curated_initiatives": [{"title": "Vendor Contract Renewal", "display_text": "Wrapped up."}],
                 "features": [
@@ -152,16 +164,18 @@ async def run_live_checks(database_url: str):
             assert prior is not None
             assert prior["report_id"] == report_id_v1
             assert prior["rag_status"] == "Amber"
+            assert prior["trend_line"] == "", "trend_line should round-trip as an empty string, not null"
             assert len(prior["features"]) == 1 and prior["features"][0]["status_label"] == "At Risk"
             assert prior["features"][0]["evidence"] == ["comment: vendor sandbox unstable"]
             assert len(prior["initiatives"]) == 1
             assert "status_label" not in prior["initiatives"][0]
             print("  PASS  get_prior_week_report returns full data once approved — features, "
-                  "initiatives, and evidence round-trip correctly; initiatives stay label-free")
+                  "initiatives, evidence, and trend_line all round-trip correctly; initiatives stay label-free")
 
             # 7. Re-save the SAME week (a rerun) — should upsert (same report_id), reset approval
             report_v2 = dict(report_v1)
             report_v2["rag_status"] = "Green"
+            report_v2["trend_line"] = "Improved from Amber to Green since last week."
             report_v2["features"] = [
                 {"feature_id": 101, "title": "Build Agentic Dashboard", "short_description": "Dashboard work",
                  "status_label": "On Track", "progress_summary": "Demo delivered.", "risk": None, "evidence": []},
@@ -184,8 +198,21 @@ async def run_live_checks(database_url: str):
                 await conn.close()
             prior = await client.call("get_prior_week_report", {"project_id": TEST_PROJECT_ID})
             assert prior["rag_status"] == "Green"
+            assert prior["trend_line"] == "Improved from Amber to Green since last week."
             assert len(prior["features"]) == 1 and prior["features"][0]["status_label"] == "On Track"
-            print("  PASS  feature_snapshots were replaced wholesale on re-save (no duplicate/stale rows)")
+            print("  PASS  feature_snapshots were replaced wholesale on re-save (no duplicate/stale rows), "
+                  "and trend_line updates along with everything else")
+
+            # 8. rag_status "Unknown" must be accepted — this failed against the live DB before
+            # the CHECK constraint fix (found during core/orchestrator.py's live verification,
+            # a real pipeline run that legitimately produced Unknown for the first time).
+            report_unknown = dict(report_v1)
+            report_unknown["week_of"] = "2026-08-09"
+            report_unknown["rag_status"] = "Unknown"
+            report_unknown["features"] = []
+            saved_unknown = await client.call("save_report_snapshot", {"project_id": TEST_PROJECT_ID, "report": report_unknown})
+            assert "error" not in saved_unknown, f"saving rag_status='Unknown' must succeed: {saved_unknown}"
+            print("  PASS  rag_status='Unknown' is accepted by the CHECK constraint")
 
     finally:
         conn = await asyncpg.connect(database_url)
