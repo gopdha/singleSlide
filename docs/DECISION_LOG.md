@@ -408,3 +408,49 @@ category of leak also showed up as the model's own word choice
 the first genuine end-to-end live run across real ADO, real Anthropic,
 and real Neon together — neither was reachable by any single component's
 own isolated live verification.
+
+## Discovery Agent's interaction model — AskUserQuestion investigated and rejected
+See `CLAUDE.md`'s "Known gotchas" (#13). Different in kind from every
+other gotcha logged so far: not a bug found and fixed, but a risk
+identified and avoided during design, before any code was written. Logged
+in the same place anyway — a future contributor deciding "why not just
+use `AskUserQuestion` here, it's right there in the tool list" needs to
+see this reasoning as readily as they'd see any other gotcha, not have to
+rediscover it by hitting the same failure mode gotcha #10 already cost
+real time on.
+
+## Discovery Agent — "Tag" vs. "Tags" crash, and why only ONE question became closed-choice
+See `CLAUDE.md`'s "Known gotchas" (#14) for the bug itself. Worth recording
+separately here is the *scoping* reasoning, since the natural next question
+— "should every free-text prompt in this conversation become multiple
+choice, to make this whole failure class structurally impossible?" — was
+explicitly considered and answered **no, only this one**. Audited every
+free-text question in the flow individually: `child_types` and
+`child_relation` are read only as prose context by `feature_agent`'s own
+agentic investigation loop, with no deterministic exact-match code path
+anywhere touching them — no crash risk exists there at all.
+`work_item_type` and `story_points_field` both already had a real
+safety net before this bug was even found (a zero-sample retry, and an
+all-empty-sample sanity check, respectively) — converting those to closed
+choice would harden something that wasn't actually broken. Only
+`filter_field` combined the dangerous shape: free text, matched against a
+small closed dict, with no existing safety net. Converting everything
+"to be safe" would have been solving risks that don't exist at the cost
+of a more rigid, less natural conversation — the fix was scoped to where
+the actual vulnerability was, not applied as a blanket policy.
+
+## Discovery Agent — a flagged-and-overridden gap must survive into the persisted skill, not just be resolved in the moment
+See `CLAUDE.md`'s "Known gotchas" (#15). Same first live session as the
+"Tag"/"Tags" bug, a different category of gap: `story_points_field`'s
+sanity check correctly fired and the PM's "keep it anyway" was a
+legitimate call — the bug wasn't in the decision, it was that the
+decision left no trace. This is the same principle as "verify
+mechanically-checkable claims in code, never trust the agent's
+self-report" (above), pushed one step further: that convention was
+originally about not trusting a model to self-certify a structured claim
+(the risk floor, grounding coverage). Here there's no model claim to
+verify at all — the risk is a human-approved override of a real,
+code-detected gap simply not being written down anywhere durable.
+`_append_caveats`'s deterministic guarantee closes that gap the same way
+the rest of this convention does: don't hope something important makes it
+into the output, make it structurally certain it does.
