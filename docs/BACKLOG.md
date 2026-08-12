@@ -14,12 +14,20 @@ to `ppt_mcp`'s `parse_confidence` field, which does have this. Worth
 adding if Needs Human Review turns out to be either much rarer or much
 more common than expected in practice.
 
-## 2. PM correction feedback loop (was FR-17 in the original PRD)
-If a PM corrects a Feature's status at Review Gate (e.g. overrides
-"On Track" to "At Risk" because they know something the agent doesn't),
-that correction currently goes nowhere — doesn't inform next week's
-investigation. Original PRD had this as an explicit requirement; it got
-dropped during the architecture redesign and was never reconnected.
+## 2. PM correction feedback loop (was FR-17 in the original PRD) — PARTIALLY RESOLVED
+**Free-text half resolved by `review_gate/`'s build** (see
+`docs/DECISION_LOG.md`, "`review_gate/` — the last component..."): a PM's
+reject reasoning is now captured via `approve_report`'s `notes` param and
+persisted in `weekly_reports.review_notes`, required (non-empty) on every
+reject — not discarded the way it was before this component existed.
+
+**Still genuinely deferred, not solved by the above**: a *structured*
+correction (e.g. overriding a specific Feature's status label field, not
+just free-text prose about it) that could programmatically inform next
+week's Feature Agent investigation. `review_notes` is a human-readable
+record for whoever reviews history, not a machine-readable diff Feature
+Agent could consume. That fuller version — was this PRD's original intent
+— remains deferred until real usage shows it's worth the complexity.
 
 ## 3. Skills for the Critique Agent's rubric
 Slide Generation's locked template and Feature Agent's entry criteria are
@@ -124,3 +132,41 @@ typical — raising the cap trades cost (each cycle is 3 more real LLM
 calls) for a higher chance of a clean pass; the alternative is accepting
 that `reviewed: False` will be a normal, not-rare outcome that Review
 Gate (not yet built) needs to handle gracefully as routine, not exceptional.
+
+## 12. `discovery_agent`'s scope is incomplete — it only generates 2 of the 4 skills a real run needs
+`synthesis_agent` and `critique_agent` each require
+`skills/<project_id>/{synthesis-agent,critique-agent}/SKILL.md` to run at
+all (`load_skill` raises `FileNotFoundError` loudly if missing — no silent
+default). `discovery_agent`'s scope has only ever covered `feature-agent`
+and `status-report-agent` (see its own README's "Scope" section) — the
+other two exist for `ai-reports-demo` only because they were hand-authored
+once, early in the build, as reference examples for `discovery_agent`'s own
+body-drafting prompts to imitate. Nobody built a generation path for them.
+
+**This is now proven to block a real run, not a theoretical gap**: the
+first genuine `run_pipeline()` attempt for `project_id="singleslide"` — a
+project onboarded entirely through `discovery_agent`, exactly as designed
+— hit `FileNotFoundError` on both missing skills immediately. Unblocked for
+that run by hand-authoring `skills/singleslide/{synthesis-agent,
+critique-agent}/SKILL.md`, mirroring `ai-reports-demo`'s real ones in shape
+and tone (minimal frontmatter, prose body, explicitly no
+project-specific curation/tone quirks yet since none have been observed) —
+but that's a one-off unblock, not a fix. Any *future* new project
+onboarded through `discovery_agent` alone hits the identical wall.
+
+**Concrete scope for the fix**: either (a) extend `discovery_agent` with two
+more conversation flows for these skills, or (b) build a smaller, separate
+flow just for these two — they're lighter than `feature-agent`'s (no ADO
+sampling, no validate-against-real-data loop needed, since there's no
+structural entry-criteria decision to get right, just tone/curation
+prose and a rubric). `synthesis-agent`'s skill only ever needs: tone
+notes, overflow-trimming priorities beyond the hard-coded floor rule, and
+continuity-narrative style. `critique-agent`'s skill only ever needs: the
+skill-defined rubric criteria (tone-matches-severity, conciseness,
+trend_line quality, jargon, headline-first, per `ai-reports-demo`'s real
+example) — plausibly even a short PM Q&A ("any tone preferences beyond
+plain and direct? any phrases to flag?") rather than the full
+sample-then-validate flow `feature-agent`'s discovery uses. Whichever
+shape, the acceptance test is the one that just failed: a project onboarded
+through `discovery_agent` alone, with zero hand-authored skills, should be
+able to complete a real `run_pipeline()`.

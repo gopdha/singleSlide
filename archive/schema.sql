@@ -47,6 +47,12 @@ CREATE TABLE IF NOT EXISTS weekly_reports (
     curated_initiatives JSONB NOT NULL,    -- same idea for Initiative Status slide
     pm_approved_at     TIMESTAMPTZ,        -- NULL = pending Review Gate; reset to NULL
                                             -- whenever this (project_id, week_of) is re-saved
+    review_notes       TEXT NOT NULL DEFAULT '', -- PM's free-text notes from Review Gate —
+                                            -- Backlog item 2's "PM correction feedback loop"
+                                            -- deferral, resolved narrowly (notes only, no
+                                            -- structured pm_edits diff) now that review_gate/
+                                            -- is the real consumer. Written on both approve and
+                                            -- reject via archive's approve_report tool.
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (project_id, week_of)
 );
@@ -66,6 +72,10 @@ ALTER TABLE weekly_reports ADD COLUMN IF NOT EXISTS trend_line TEXT NOT NULL DEF
 ALTER TABLE weekly_reports DROP CONSTRAINT IF EXISTS weekly_reports_rag_status_check;
 ALTER TABLE weekly_reports ADD CONSTRAINT weekly_reports_rag_status_check
     CHECK (rag_status IN ('Red', 'Amber', 'Green', 'Unknown'));
+
+-- Same idempotent-addition pattern as trend_line above, for the same reason: weekly_reports
+-- existed before review_gate/ (and its approve_report tool) did.
+ALTER TABLE weekly_reports ADD COLUMN IF NOT EXISTS review_notes TEXT NOT NULL DEFAULT '';
 
 CREATE TABLE IF NOT EXISTS feature_snapshots (
     snapshot_id        BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

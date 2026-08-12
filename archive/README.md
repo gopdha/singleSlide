@@ -19,7 +19,7 @@ projects (project_id PK, caller-supplied)
                   └── 1:N ── initiative_snapshots (report_id FK)
 ```
 
-Full DDL in `schema.sql`. Four things worth knowing before touching this schema:
+Full DDL in `schema.sql`. Five things worth knowing before touching this schema:
 
 - **`weekly_reports.trend_line`** (added post-launch, via `core/orchestrator.py`'s build —
   see `docs/DECISION_LOG.md`) holds Synthesis Part C's short continuity callout vs. the
@@ -27,6 +27,12 @@ Full DDL in `schema.sql`. Four things worth knowing before touching this schema:
   week to compare against. `schema.sql` has both the `CREATE TABLE` column and a
   standalone idempotent `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, since the table
   already existed in deployed databases before this column did.
+- **`weekly_reports.review_notes`** (added post-launch, via `review_gate/`'s build — see
+  `docs/DECISION_LOG.md`) holds the PM's free-text Review Gate notes, written by
+  `approve_report` on both approve and reject. `NOT NULL DEFAULT ''`, same idempotent
+  `CREATE TABLE` column + `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` pattern as
+  `trend_line`. This is Backlog item 2's "PM correction feedback loop" resolved
+  narrowly — free-text notes only, not a structured `pm_edits` diff (still deferred).
 - **`feature_snapshots`/`initiative_snapshots` vs. `curated_features`/`curated_initiatives`
   are deliberately different things.** The snapshot tables hold every Feature/Initiative
   investigated that week, full detail — what `get_prior_week_report` needs for continuity.
@@ -47,15 +53,24 @@ Nothing here is skill-defined — Archive is pure persistence with a fixed schem
 fixed tool contracts. The skill/code boundary that applies to Feature Agent and Status
 Report Agent doesn't apply here; there's no per-project investigation strategy to vary.
 
-## The 5 tools
+## The 7 tools
 
 ```
 ensure_project(project_id, name, input_config) -> {project_id, created}
 get_prior_week_report(project_id) -> full prior APPROVED week (features + initiatives), or null
 save_report_snapshot(project_id, report) -> {report_id}   # one transactional write
+get_latest_unreviewed_report(project_id) -> latest report pending Review Gate, or null
+approve_report(report_id, approved, notes="") -> {report_id, pm_approved_at, review_notes}
 save_preference_profile(project_id, profile) -> {profile_id}
 list_available_inputs(project_id) -> {project_id, input_config}
 ```
+
+`get_latest_unreviewed_report` and `approve_report` exist for `review_gate/` (added when
+that component was built — see `docs/DECISION_LOG.md`). `get_latest_unreviewed_report` is
+deliberately leaner than `get_prior_week_report` — no `feature_snapshots`/
+`initiative_snapshots` join — since `render_report()` never reads those fields.
+`approve_report` is the only tool that can set `pm_approved_at`; `save_report_snapshot`
+can only ever *reset* it to `NULL`, never grant approval.
 
 Each has a plain async `_impl` function (importable directly, no MCP protocol needed)
 plus a thin `@mcp.tool()`-decorated wrapper that catches exceptions and returns

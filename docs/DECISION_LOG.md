@@ -656,3 +656,78 @@ anchor. This is why `agents/slide_generation_agent`'s design PARAMETER
 generation stays a proposal the PM reviews rather than being trusted
 blind either way — but the fix here is a genuine usability fix, not a
 justification for the review step to paper over a preventable failure mode.
+
+## `review_gate/` — the last component, deliberately the smallest, and why it needed two new Archive tools
+Unlike every prior component, `review_gate/` added almost no new business logic of its
+own — `render_report()` (`agents/slide_generation_agent`, Mode 2, already fully
+deterministic) does the actual rendering; this component's job is to call it, show a
+human the result, and record the decision. The design work here was tracing three
+existing signatures precisely enough to confirm that was actually true, not assuming it.
+
+**Traced, not assumed: `core/orchestrator.py`'s `run_pipeline()` report shape needs no
+adapter into `render_report()`.** `run_pipeline()` nests `synthesize_report()`'s complete
+output under `result["report"]`; a direct grep of every `report[...]`/`report.get(...)`
+access inside `render_report()` confirmed it reads exactly `rag_status`,
+`executive_summary`, `trend_line` (optional), `curated_features`, `curated_initiatives`,
+`week_of` (optional, filename only) — a strict subset of what `run_pipeline()` already
+provides. This is the same kind of check that caught the `feature_id`/`id` mismatch
+between `feature_agent` and `status_report_agent` earlier in this build — here it came
+back clean, and that conclusion is worth as much confidence as the mismatch it didn't
+find, precisely because it was checked the same rigorous way rather than assumed by
+analogy.
+
+**No archive tool could be reused to set `pm_approved_at` — a real gap, not an oversight
+to patch around.** `save_report_snapshot`'s SQL hardcodes `pm_approved_at = NULL` on both
+`INSERT` and its `ON CONFLICT` `UPDATE` — by design (a re-save must reset stale
+approval, per the original Archive schema decisions above), which means it structurally
+*cannot* be reused to grant approval, only ever to reset it. Added `approve_report
+(report_id, approved, notes="")` as the one and only tool that can set
+`pm_approved_at`, keyed on `report_id` (already a global PK, and already in hand from
+`run_pipeline()`'s own return value in the common case) rather than `project_id` — no
+cross-project ambiguity risk, and no reason to route through a project lookup for an
+operation that's inherently about one specific report.
+
+**`get_latest_unreviewed_report` is deliberately leaner than `get_prior_week_report`, not
+a copy-paste of it.** The two look similar (latest `weekly_reports` row by `week_of`,
+opposite `pm_approved_at` filter) but `get_prior_week_report` joins
+`feature_snapshots`/`initiative_snapshots` for Synthesis Agent's continuity narrative —
+data `render_report()` never reads. Pulling data nobody consumes just because a similar
+query already existed would be the same "pass everything through" instinct gotcha #12
+warned against, one layer up (an unnecessary join instead of an unnecessary dict spread).
+
+**Two supported call shapes, both real, not one built and one speculative.** In-process
+chaining (`report`/`report_id` passed directly, right after `run_pipeline()` — zero extra
+Archive round-trip) and standalone (`project_id` alone, fetches via
+`get_latest_unreviewed_report`) are both genuine, expected usage patterns — a scheduled/
+unattended pipeline run and a PM reviewing on their own time are not the same session.
+Validated up front (`ValueError` if `report`/`report_id` are given inconsistently — one
+without the other) rather than silently guessing which mode was intended.
+
+**`SlideFitError` finally reaches a real human-facing surface, and it routes through the
+exact same `approve_report(approved=False, ...)` call a human rejection makes — not a
+parallel mechanism.** Per the entry above ("What 'escalate to the PM' concretely means
+today"), `render_report()`'s `SlideFitError` had nowhere to go until this component
+existed. A report that can't even render can't be shown to a human to judge, so treating
+it as an automatic reject (with the error text as the notes) is the honest translation,
+not a special case bolted on beside the real rejection path — confirmed by a dedicated
+test asserting `ask_human` is never even consulted when this fires, proving it's the same
+code path, not a look-alike one.
+
+**`review_notes` (Backlog item 2) is resolved now, narrowly, because its real consumer
+exists — not new scope creep.** Backlog item 2 ("PM correction feedback loop") and the
+Archive schema's own "`pm_edits` intentionally not a column" note both explicitly framed
+this as deferred until "real usage shows whether it's worth the complexity," not
+abandoned. `review_gate/` is that real usage: Requirement 18 requires capturing a PM's
+reject reasoning, and there was nowhere to put it. Resolved deliberately narrowly —
+`review_notes TEXT`, free-text only, written on both approve and reject via
+`approve_report` — not the fuller structured `pm_edits` diff (what specifically changed,
+field by field) that item 2 also gestured at, which remains genuinely deferred. Same
+idempotent `CREATE TABLE` column + `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` two-part
+pattern already established for `trend_line`.
+
+**Reject requires non-empty notes — `run_review_gate` loops until given, never accepts a
+silent rejection.** Same instinct as gotcha #15 (a flagged gap must survive into the
+persisted record, not evaporate) applied to the human's own input this time, not the
+model's: a reject with no reason recorded would leave a future reader with exactly the
+same "the decision happened, the reasoning didn't survive" gap gotcha #15 fixed for
+Discovery Agent's caveats.
