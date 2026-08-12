@@ -59,12 +59,18 @@ def run_structural_checks():
         "needs the idempotent DROP+ADD for already-existing databases with the old 3-value constraint"
     print("  PASS  rag_status CHECK constraint includes Unknown, with an idempotent DROP+ADD for pre-existing databases")
 
+    assert "review_notes" in schema_sql_no_comments and "ADD COLUMN IF NOT EXISTS review_notes" in schema_sql_no_comments, \
+        "review_notes needs both the CREATE TABLE column and the idempotent ALTER for already-existing databases " \
+        "(same two-part pattern as trend_line) — added for review_gate/'s approve_report tool"
+    print("  PASS  schema.sql has review_notes on weekly_reports, with an idempotent ALTER for pre-existing databases")
+
     assert SERVER_PATH.exists()
     server_src = SERVER_PATH.read_text(encoding="utf-8")
     for tool in ("ensure_project", "get_prior_week_report", "save_report_snapshot",
-                 "save_preference_profile", "list_available_inputs"):
+                 "save_preference_profile", "list_available_inputs",
+                 "get_latest_unreviewed_report", "approve_report"):
         assert f'name="{tool}"' in server_src, f"server.py missing @mcp.tool for {tool}"
-    print("  PASS  server.py declares all 5 tools")
+    print("  PASS  server.py declares all 7 tools")
 
     assert "mcp.server.mcpserver import MCPServer" in server_src, \
         "server.py must use the verified mcp>=2.0.0 import path (see CLAUDE.md gotcha #9)"
@@ -150,15 +156,22 @@ async def run_live_checks(database_url: str):
             assert prior is None
             print("  PASS  get_prior_week_report still returns null — saving does not imply approval")
 
-            # 6. Simulate Review Gate approval directly (no approve tool exists yet — Review
-            # Gate isn't built). This is test-only DB access, not something a real caller does.
-            conn = await asyncpg.connect(database_url)
-            try:
-                await conn.execute(
-                    "UPDATE weekly_reports SET pm_approved_at = now() WHERE report_id = $1", report_id_v1
-                )
-            finally:
-                await conn.close()
+            # 5b. get_latest_unreviewed_report sees the just-saved, not-yet-approved report
+            unreviewed = await client.call("get_latest_unreviewed_report", {"project_id": TEST_PROJECT_ID})
+            assert unreviewed is not None and unreviewed["report_id"] == report_id_v1
+            assert unreviewed["rag_status"] == "Amber"
+            assert "features" not in unreviewed, "get_latest_unreviewed_report must not join feature_snapshots — render_report() never reads it"
+            print("  PASS  get_latest_unreviewed_report returns the pending report, leaner than get_prior_week_report (no feature/initiative join)")
+
+            # 6. approve_report — the real tool, not a raw DB bypass (Review Gate now exists)
+            approval = await client.call("approve_report", {"report_id": report_id_v1, "approved": True, "notes": "Looks good, approving."})
+            assert approval["pm_approved_at"] is not None
+            assert approval["review_notes"] == "Looks good, approving."
+            print("  PASS  approve_report(approved=True) sets pm_approved_at and records notes")
+
+            still_unreviewed = await client.call("get_latest_unreviewed_report", {"project_id": TEST_PROJECT_ID})
+            assert still_unreviewed is None, "an approved report must no longer show up as pending"
+            print("  PASS  get_latest_unreviewed_report returns null once the pending report is approved")
 
             prior = await client.call("get_prior_week_report", {"project_id": TEST_PROJECT_ID})
             assert prior is not None
@@ -188,20 +201,33 @@ async def run_live_checks(database_url: str):
             assert prior is None, "pm_approved_at must reset to NULL when an approved week is re-saved"
             print("  PASS  pm_approved_at resets to NULL on re-save, as designed")
 
-            # Re-approve and confirm the old feature row was replaced, not accumulated
-            conn = await asyncpg.connect(database_url)
-            try:
-                await conn.execute(
-                    "UPDATE weekly_reports SET pm_approved_at = now() WHERE report_id = $1", report_id_v1
-                )
-            finally:
-                await conn.close()
+            # Re-approve (via the real tool again) and confirm the old feature row was
+            # replaced, not accumulated
+            await client.call("approve_report", {"report_id": report_id_v1, "approved": True, "notes": ""})
             prior = await client.call("get_prior_week_report", {"project_id": TEST_PROJECT_ID})
             assert prior["rag_status"] == "Green"
             assert prior["trend_line"] == "Improved from Amber to Green since last week."
             assert len(prior["features"]) == 1 and prior["features"][0]["status_label"] == "On Track"
             print("  PASS  feature_snapshots were replaced wholesale on re-save (no duplicate/stale rows), "
                   "and trend_line updates along with everything else")
+
+            # 6b. approve_report(approved=False) — a reject — must leave pm_approved_at NULL
+            # (still pending), not set it, while still recording notes
+            rejection = await client.call("approve_report", {"report_id": report_id_v1, "approved": False, "notes": "Executive summary buries the headline risk."})
+            assert rejection["pm_approved_at"] is None
+            assert rejection["review_notes"] == "Executive summary buries the headline risk."
+            still_pending = await client.call("get_prior_week_report", {"project_id": TEST_PROJECT_ID})
+            assert still_pending is None, "a rejected report must not appear as the approved prior week"
+            print("  PASS  approve_report(approved=False) leaves pm_approved_at NULL (still pending) but records the rejection notes")
+
+            # 6c. approve_report on a nonexistent report_id errors loudly, doesn't silently no-op
+            bad = await client.call("approve_report", {"report_id": 999999999, "approved": True, "notes": ""})
+            assert "error" in bad
+            print("  PASS  approve_report errors loudly for a nonexistent report_id, rather than silently no-op'ing")
+
+            # Leave report_id_v1 approved again for cleanliness (matches this section's own
+            # narrative — the report ultimately gets approved after the reject round-trip)
+            await client.call("approve_report", {"report_id": report_id_v1, "approved": True, "notes": "Re-approved after revision."})
 
             # 8. rag_status "Unknown" must be accepted — this failed against the live DB before
             # the CHECK constraint fix (found during core/orchestrator.py's live verification,

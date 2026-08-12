@@ -250,6 +250,94 @@ async def save_report_snapshot(project_id: str, report: dict[str, Any]) -> dict[
 
 
 # ---------------------------------------------------------------------------
+# get_latest_unreviewed_report
+# ---------------------------------------------------------------------------
+
+async def get_latest_unreviewed_report_impl(project_id: str) -> Optional[dict[str, Any]]:
+    """Deliberately leaner than get_prior_week_report_impl — no feature_snapshots/
+    initiative_snapshots join. review_gate/render_report() never reads features/
+    initiatives (only rag_status/executive_summary/trend_line/curated_features/
+    curated_initiatives), so there's no reason to fetch data nobody consumes."""
+    pool = await _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT report_id, week_of, rag_status, executive_summary, trend_line,
+                   curated_features, curated_initiatives
+            FROM weekly_reports
+            WHERE project_id = $1 AND pm_approved_at IS NULL
+            ORDER BY week_of DESC
+            LIMIT 1
+            """,
+            project_id,
+        )
+    if row is None:
+        return None
+    return {
+        "report_id": row["report_id"],
+        "week_of": _iso(row["week_of"]),
+        "rag_status": row["rag_status"],
+        "executive_summary": row["executive_summary"],
+        "trend_line": row["trend_line"],
+        "curated_features": row["curated_features"],
+        "curated_initiatives": row["curated_initiatives"],
+    }
+
+
+@mcp.tool(
+    name="get_latest_unreviewed_report",
+    description="The most recent weekly report for this project still pending Review Gate "
+                "(pm_approved_at IS NULL, latest week_of) — enough to render, not the full "
+                "feature/initiative snapshots. Returns null if nothing is pending.",
+)
+async def get_latest_unreviewed_report(project_id: str) -> Optional[dict[str, Any]]:
+    try:
+        return await get_latest_unreviewed_report_impl(project_id)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# approve_report
+# ---------------------------------------------------------------------------
+
+async def approve_report_impl(report_id: int, approved: bool, notes: str = "") -> dict[str, Any]:
+    """Sets pm_approved_at iff approved (a reject leaves it NULL — still 'pending' by the
+    column's existing semantics, so a rejected report never masquerades as the approved
+    prior week via get_prior_week_report). notes is always written, approve or reject —
+    Review Gate's own conversation enforces non-empty notes on reject; this tool is a
+    thin, honest primitive that doesn't duplicate that policy."""
+    pool = await _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE weekly_reports
+            SET pm_approved_at = CASE WHEN $2 THEN now() ELSE NULL END,
+                review_notes = $3
+            WHERE report_id = $1
+            RETURNING report_id, pm_approved_at, review_notes
+            """,
+            report_id, approved, notes,
+        )
+    if row is None:
+        raise ValueError(f"No weekly_reports row found for report_id {report_id}.")
+    return {"report_id": row["report_id"], "pm_approved_at": _iso(row["pm_approved_at"]), "review_notes": row["review_notes"]}
+
+
+@mcp.tool(
+    name="approve_report",
+    description="Records a PM's Review Gate decision for report_id — sets pm_approved_at to "
+                "now() if approved, leaves it NULL (still pending) if not — and always writes "
+                "notes. Errors loudly if report_id doesn't exist.",
+)
+async def approve_report(report_id: int, approved: bool, notes: str = "") -> dict[str, Any]:
+    try:
+        return await approve_report_impl(report_id, approved, notes)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
 # save_preference_profile
 # ---------------------------------------------------------------------------
 
