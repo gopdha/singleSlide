@@ -454,3 +454,205 @@ code-detected gap simply not being written down anywhere durable.
 `_append_caveats`'s deterministic guarantee closes that gap the same way
 the rest of this convention does: don't hope something important makes it
 into the output, make it structurally certain it does.
+
+## Why Requirement 17's pptx Skill is superseded
+Requirement 17 originally specified "Claude Agent SDK Skills: the built-in
+`pptx` skill plus a project-specific generated skill for the locked
+template." Investigated before writing any of `agents/slide_generation_agent`
+— the same way AskUserQuestion was investigated for Discovery Agent (see
+above) — not discovered broken after the fact, avoided before any code
+existed. Three findings, in order of directness:
+
+1. `claude_agent_sdk`'s own generated tool schema (`sdk-tools.d.ts`,
+   auto-generated from the real CLI — "DO NOT MODIFY BY HAND") has no
+   `Skill` tool definition at all, and zero occurrences of
+   "pptx"/"docx"/"xlsx" anywhere in the file. The only skill-adjacent entry
+   is `ProposeSkills` — an unrelated mechanism for proposing *new*
+   user-level `SKILL.md` files from observed patterns, not invoking a
+   pre-built one.
+2. `ClaudeAgentOptions.skills` (the real SDK mechanism for enabling skills)
+   discovers skills from filesystem `SKILL.md` files under user/project
+   settings and installed plugins — its own docstring says so directly, not
+   a built-in registry reachable by name alone.
+3. A full search of every place this development machine would discover a
+   skill from — all plugin marketplace skills, user-level skills, and this
+   project's own (nonexistent) `.claude/` directory — found 29 real
+   installed skills (discord, telegram, frontend-design, skill-creator,
+   etc.) and zero pptx/docx/xlsx/office-document skill anywhere.
+
+**Conclusion: no pptx Skill exists in this environment, with no invocation
+path in the tool schema either** — a stronger finding than AskUserQuestion's
+"reachable but unverified" (gotcha #13). Anthropic does publish a public
+`pptx` skill (in `anthropics/skills`), but it targets the Messages API's
+code-execution/container beta — upload skill files to a sandboxed container
+via the Files API — a fundamentally different integration than every other
+agent in this codebase, which calls `claude_agent_sdk.query()` against MCP
+servers with narrow `allowed_tools`. Even installed, that skill's own
+authoring pattern drives Bash + Write broadly inside its container, which
+would have been a real, deliberate architectural departure from this
+project's narrow-tool-scope convention — not something to grant by default.
+
+Superseded the same way Excel and the PI concept were superseded (see
+above): the requirement's current, authoritative form is python-pptx
+(already a dependency — `mcp_servers/ppt_mcp` uses it to PARSE `.pptx`;
+`slide_generation_agent` uses it to WRITE one, same library, opposite
+direction) doing all actual rendering, deterministically. The agentic piece
+is scoped narrowly to what genuinely needs judgment — palette/font/layout-
+archetype PARAMETER selection at onboarding — never raw file manipulation.
+This matches this project's "deterministic where reproducibility matters"
+principle more literally than an LLM-driven pptx Skill would have anyway: a
+rendered slide from the same finalized report data must be exactly
+reproducible, not vary run to run.
+
+## Slide Generation Agent — layout archetypes as a fixed enum, the auto-fit lever order, and what "escalate" means today
+Three more decisions made while designing `agents/slide_generation_agent`,
+beyond the pptx-Skill finding above:
+
+**The agentic call (Mode 1) never emits raw layout coordinates.** Considered
+having the LLM design full slide geometry (inch/pixel positions) per
+candidate. Rejected: it has no way to visually verify a coordinate choice,
+and this project's discipline has repeatedly had to catch exactly this kind
+of unverifiable model output after the fact (`curate_report`'s risk floor,
+`critique_report`'s re-check). Instead, the LLM picks a `layout_archetype`
+from a small fixed enum (`single_column_narrative`,
+`two_column_metrics_sidebar`, `banner_header_grid`) — each fully implemented
+as a deterministic drawing function in code — plus palette/fonts/flex_bounds
+suited to that archetype's character. Code owns 100% of the actual drawing
+math; the model's job is narrowed to parameters it can reason about in text,
+matching the owner's original lean (agentic PARAMETERS, deterministic
+rendering) more literally than raw-coordinate generation would have.
+
+**3 archetypes, not more, deliberately not over-built for speculative
+variety.** This is a one-time PM choice at onboarding (Requirement 14); 3
+genuinely distinguishable options (a narrative list, a metrics-sidebar
+dashboard, a formal banner/grid) are enough to form a real preference
+without making the choice harder, and the skill format doesn't lock in a
+count — a 4th archetype is an additive change later if real usage ever
+shows 3 isn't enough, not a redesign.
+
+**The auto-fit ladder's lever order (font size → row height → truncation)
+is fixed code, not skill-negotiable** — it directly mirrors Requirement 15's
+own listed order, and matches this project's skill/code boundary: the
+*bound values* vary per project's locked template (skill-defined), but the
+*algorithm* that walks those bounds is code-enforced, exactly parallel to
+how `rag_rollup.py`'s rule is fixed code fed by agent-produced labels. Mode
+2 (`render_report`) has zero LLM calls as a result — a genuine testability
+win exploited directly in the test suite (the full ladder, including the
+SlideFitError raise-at-cap case, is unit-tested with no credentials, same
+tier as `rag_rollup.py`).
+
+**What "escalate to the PM" (Requirement 16) concretely means today:**
+`render_report` raises `SlideFitError` when content doesn't fit even at the
+tightest flex bounds. Since `review_gate/` doesn't exist yet and nothing in
+`core/orchestrator.py` calls `slide_generation_agent` yet, there is no
+PM-facing surface to hand this to — the exception propagates to the caller,
+exactly the way `critique_agent`'s risk-floor `RuntimeError` already does.
+No `review_gate` interface was invented to catch it prematurely; whoever
+wires `orchestrator.py` → `slide_generation_agent` next inherits this
+exception the same way.
+
+**Known limitation, not hidden:** python-pptx has no real text-layout
+engine — there's no way to ask it "how many lines will this text wrap to at
+this font size in this box" and get PowerPoint's actual answer. The fit
+heuristic (`_estimate_block_height_in`) is a deterministic APPROXIMATION (a
+fixed average-character-width formula), not exact rendering measurement.
+Reproducible — the same content always gets the same fit decision — but not
+pixel-exact. Documented in the module docstring and here rather than implied
+to be more precise than it is.
+
+## Slide Generation Agent — a self-contradictory candidate fails the whole batch, not just itself
+The first real live run of Mode 1 (`run_slide_generation_discovery`) crashed:
+a candidate proposed `row_height_in_min` (0.28) above the code's own default
+row padding, and the only place that was ever checked was deep inside
+`_fit_rows` at render time — a `ValueError` mid-draw, ending the session
+with no PM-facing explanation. See `CLAUDE.md` gotcha #17 for the bug and
+its two-part fix (`_validate_flex_bounds` run immediately after generation,
+before any render; the previously-inconsistent hardcoded row-padding
+defaults consolidated into one `DEFAULT_ROW_PADDING_IN` constant, since that
+inconsistency is what let an invalid candidate look "accidentally valid").
+
+Worth recording separately here is the design decision this raised: when
+exactly one of 3 candidates fails `_validate_flex_bounds`, should the whole
+batch be rejected, or should just that one candidate be silently dropped so
+the PM still sees 2 options instead of a hard failure? Chose **whole-batch
+failure**, and — critically — this is a genuinely different situation from
+the *already-existing* "one candidate hits `SlideFitError` during render,
+drop it and let the PM pick among the survivors" handling built earlier in
+the same function, not the same case reached twice:
+
+- **`SlideFitError` is a legitimate outcome even for a perfectly
+  well-formed candidate.** `_generate_candidates`'s prompt never shows the
+  model the sample content it will later be rendered against (by design —
+  see the layout-archetype entry above, the model reasons about parameters,
+  not content) — a candidate's bounds can be entirely self-consistent and
+  still not happen to accommodate a specific piece of content it never saw.
+  Dropping that one candidate and continuing is not hiding a problem with
+  the model's output; it's a normal, expected content-fit limitation, no
+  different in kind from why the ladder exists at all.
+- **An internally self-contradictory `flex_bounds` is content-independent.**
+  `row_height_in_min > DEFAULT_ROW_PADDING_IN` is wrong regardless of what
+  it's ever rendered against — no sample content could make it valid.
+  `DESIGN_SYSTEM_PROMPT` already states the constraint this violates
+  plainly ("row_height_in_min must be a real compression from a comfortable
+  default... validated in code after you respond"). A candidate failing
+  this check is evidence the model didn't reliably follow an explicit,
+  self-contained numeric instruction on this attempt — and nothing
+  guarantees the other 2 candidates are trustworthy either; they simply
+  didn't happen to trip the specific check being looked for. Silently
+  dropping the flagged one and presenting the 2 "survivors" as if the batch
+  was fine would hide from the PM that the generation call had already
+  demonstrated it doesn't reliably follow its own instructions.
+
+Same underlying principle as the risk floor and the orchestrator's
+"independent re-verification disagreement is a bug signal" convention
+(both above): a violation of an explicit, verifiable constraint is treated
+as evidence about the whole unit of work that produced it (the batch), not
+quarantined to the one place it happened to surface.
+
+## Slide Generation Agent — a check that "correctly" keeps failing can still be the prompt's fault, not the model's
+A second live Mode 1 run hit the exact same failure category as the entry
+above — `_validate_flex_bounds` caught a self-contradictory
+`row_height_in_min` and whole-batch-failed exactly as designed — but with a
+*different* guessed value (0.24 this time, vs. the first run's 0.28). Two
+different specific numbers failing the same check is a different diagnosis
+than one number failing it once: it's evidence the model isn't converging
+toward the real constraint at all, which pointed at the constraint itself
+rather than at "the model made a mistake, try again."
+
+Checked directly: does `DESIGN_SYSTEM_PROMPT` actually state the real
+`DEFAULT_ROW_PADDING_IN` value `row_height_in_min` is compared against, or
+does it only describe the constraint in prose? Confirmed the latter — the
+prompt said `row_height_in_min` "must be a real compression from a
+comfortable default row spacing" and nothing more. Compare this to the
+other two flex_bounds levers: `font_size_pt_min` is compared against
+`body_size_pt`, and `display_text_max_chars_min` against
+`display_text_max_chars_default` — both comparison points are values the
+model proposes *itself*, in the *same* structured response, so "meaningfully
+below [the other field you're also writing]" is a fully self-referential,
+trivially satisfiable instruction. `row_height_in_min`'s comparison point,
+`DEFAULT_ROW_PADDING_IN`, is a fixed code constant the model never sees and
+was never told — every previous "fix" (the #17 entry above) addressed
+*catching* the violation, never *preventing* it, because the actual gap was
+one level upstream of validation entirely.
+
+Fixed by turning `DESIGN_SYSTEM_PROMPT` into an f-string that interpolates
+the literal `DEFAULT_ROW_PADDING_IN` constant directly into the prompt text
+(never a second, separately hardcoded number in prose that could drift out
+of sync with the real constant the way the pre-#17 scattered row-padding
+defaults did), plus a concrete suggested target range so the model has a
+number to aim for, not just a ceiling to stay under.
+
+Worth naming as its own lesson, distinct from #17 and from "verify
+mechanically-checkable claims in code": **a code-level check correctly
+rejecting bad output on every attempt is not proof the model is behaving
+unreliably — it can just as easily mean the model was never given what it
+needs to succeed.** When a check keeps failing across multiple independent
+live attempts with different specific values each time (not the same value
+repeating), that pattern itself is a signal to inspect the prompt's
+completeness before concluding the model can't follow the instruction —
+re-running a third time and hoping would have kept failing indefinitely,
+since nothing about a third attempt would give the model the missing
+anchor. This is why `agents/slide_generation_agent`'s design PARAMETER
+generation stays a proposal the PM reviews rather than being trusted
+blind either way — but the fix here is a genuine usability fix, not a
+justification for the review step to paper over a preventable failure mode.
