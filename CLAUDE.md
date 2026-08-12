@@ -61,8 +61,13 @@ and idiomatic, not just functional, since it doubles as a learning resource.
     slide count/order) never changes.
 16. Escalate to the PM, don't silently degrade, if content doesn't fit even
     at the tightest allowed flex bounds.
-17. Slide rendering uses **Claude Agent SDK Skills**: the built-in `pptx`
-    skill plus a project-specific generated skill for the locked template.
+17. Slide rendering: no built-in `pptx` Skill exists in this environment
+    (investigated and confirmed absent — see "Known gotchas" #16; superseded
+    the same way Excel and the PI concept were, see Decision Log).
+    **python-pptx renders directly**, deterministically; a project-specific
+    generated skill (`slide-generation-agent`) still holds the locked
+    template's design parameters (palette/fonts/layout archetype/flex
+    bounds), same skill/code boundary as the other two skills.
 18. Review Gate is mandatory and human — PM sees the actual rendered slide
     (not raw text/JSON) and must approve/edit. No autonomous publishing.
 
@@ -154,7 +159,7 @@ docs/           this file + DECISION_LOG.md + BACKLOG.md
 | `agents/synthesis_agent` | ✅ **Done, fully live-verified**, including three full re-verifications after later touches — the `common/risk_floor.py` extraction + `prior_week`-in-return-dict addition (for `agents/critique_agent`), the `revision_feedback` threading through Parts B/C (for `core/orchestrator.py`), and the internal-error-string leak fix (`merge_feature_enrichments` no longer spreads unknown Feature keys + a `FORBIDDEN_VOCABULARY_RULE` on both Part B/C prompts — see "Known gotchas" #12) — no regressions any time. Against a real Anthropic API and real Neon Postgres: Part A's merge logic (regression-tested for a real overlap-dilution bug found during this build), Part B's risk floor (both a real live run honoring it AND a mocked-agent test proving the code-level safety net actually fires when violated), Part C's prose, and the full `synthesize_report` path confirmed to call `archive.get_prior_week_report` exactly once per run, not once per Part |
 | `agents/critique_agent` | ✅ **Done, fully live-verified** against a real Anthropic API — a well-formed report (`passed: true`, all 2 code-enforced + 5 skill-defined checks passed) and a deliberately risk-floor-violating one (`passed: false`, driven by the real model path, not mocked) both confirmed. The violating case proved code-enforced and skill-defined checks are genuinely independent: `risk_floor` failed while all 5 skill-defined checks passed on their own merits (the prose itself was well-written even though the underlying data was broken) — `overall_feedback` correctly led with the code-enforced failure regardless |
 | `core/orchestrator.py` | ✅ **Done, fully live-verified end to end** — real ADO org, real Anthropic API, and real Neon Postgres together for the first time in this project, all 4 agents + Archive in one real `run_pipeline()` run, `report_id` persisted. Found and fixed 2 real cross-component bugs only a genuine end-to-end run could surface (see "Known gotchas" #11-12) — neither was reachable by any single component's own isolated live verification. Also 7/7 mocked control-flow tests covering all 4 revision-loop branches, and 2 real integration issues found by tracing actual signatures rather than assuming (`status_report_agent`'s `existing_features` shape, the `ensure_project`-before-`save_report_snapshot` FK requirement). Worth noting honestly: even after both fixes, the live run still ended `reviewed: False` — not a bug, but real evidence that a rigorous 5-criterion skill-defined rubric doesn't always converge within one revision; `MAX_REVISIONS` may be worth revisiting once more real runs establish a pattern, per Backlog's "revisit once real usage shows what matters" posture |
-| `agents/slide_generation_agent` | ⬜ Not started (Skills-based, 3 slides, bounded auto-fit) |
+| `agents/slide_generation_agent` | 🟨 **Implemented, tier-1 + scripted-conversation tests all pass** (33 checks: the fit heuristic's full ladder including invalid-bounds rejection and the SlideFitError raise-at-cap, `_validate_flex_bounds`'s own unit tests plus a forced-violation regression test, a structural check that the design prompt states its real numeric anchor, design-derived helpers, `default_ask_human`, and Mode 1's happy-path/regenerate-loop/cancel-path/partial-candidate-failure/all-candidates-failure conversations). **Two consecutive live runs of Mode 1 found and fixed real bugs, same failure category both times** — see "Known gotchas" #17 (a candidate's self-contradictory `flex_bounds` crashed mid-render instead of being rejected up front) and #18 (the real root cause underneath #17: the design prompt never told the model the actual numeric constant it needed to satisfy, so validation kept correctly rejecting a value the model had no way to get right). Live conversation not yet re-attempted since #18's fix — **needs the project owner to re-run it, not something this session can verify**. Two genuinely different modes: **Mode 1** (`run_slide_generation_discovery`, once per project) — one agentic call proposes 3 design PARAMETER sets (palette/fonts/flex_bounds), never raw file manipulation; each is rendered deterministically into one of 3 fixed layout archetypes (`single_column_narrative`, `two_column_metrics_sidebar`, `banner_header_grid`) already implemented in code; PM picks via `ask_human` (discovery_agent's pattern, not AskUserQuestion — same reasoning). **Mode 2** (`render_report`, every week after) — fully deterministic, zero LLM, zero MCP, same testability tier as `core/rag_rollup.py`: loads the locked skill, renders the 3 slides, auto-fits within flex_bounds (font size → row height → truncation, Requirement 15's own lever order), raises `SlideFitError` (Requirement 16's escalation) if content genuinely can't fit. Investigated and found the built-in `pptx` Skill referenced in the original Requirement 17 does not exist in this environment — see "Known gotchas" #16 — so python-pptx renders directly (already a dependency via `ppt_mcp`'s parsing side). **Mode 2's own render_report is fully unit-tested here** (all 3 archetypes, the SlideFitError overflow case, the empty-features/empty-initiatives case); genuine tier 3 for Mode 1 (opening the 3 rendered .pptx candidates and judging them as a PM would) — **needs the project owner to run it, not something this session can verify** |
 | `agents/discovery_agent` | 🟨 **Implemented, tier-1 + scripted-conversation integration tests all pass** (22 checks: WIQL-sampling helpers, `default_ask_human`'s input validation, `_normalize_field_name`/`_resolve_field`/`_append_caveats`, and full happy-path/reject-retry-loop/cancel-path/field-name-normalization/caveat-guarantee conversations for both skills, real `write_skill`/`load_skill` round-tripping, zero credentials needed). Generates `feature-agent` and `status-report-agent` skills only — slide-template skill explicitly deferred (needs `slide_generation_agent`, not built). Architecturally new: a real PM conversation via a custom `ask_human` callable, not a one-shot structured call — `AskUserQuestion` investigated and deliberately rejected (see "Known gotchas" #13). **The first genuine live attempt already found and fixed two real bugs**: a free-text answer ("Tag" vs. the expected "Tags") crashed the run (#14, fixed with a deliberately narrow scope — only that one question became closed-choice, not a blanket conversion), and a PM's legitimate override of a failed sanity check left no trace in the persisted skill (#15, fixed with a deterministic caveat-guarantee, extending this project's "verify mechanically, never trust self-report" convention to free text). Live conversation not yet re-attempted since either fix — **needs the project owner to re-run it, not something this session can verify** |
 | `review_gate/` | ⬜ Not started |
 
@@ -324,6 +329,76 @@ docs/           this file + DECISION_LOG.md + BACKLOG.md
     further: not just validating a structured field the model returned,
     but guaranteeing a specific piece of free text can't be silently
     dropped from prose at all.
+16. **The "pptx" Skill referenced in the original Requirement 17 does not
+    exist in this environment** — investigated the same way AskUserQuestion
+    was investigated for Discovery Agent (gotcha #13), before writing any of
+    `agents/slide_generation_agent`, not discovered broken after the fact.
+    Three findings: (1) `claude_agent_sdk`'s own generated tool schema
+    (`sdk-tools.d.ts` — auto-generated from the real CLI, "DO NOT MODIFY BY
+    HAND") has no `Skill` tool definition at all, and zero occurrences of
+    "pptx"/"docx"/"xlsx" anywhere in the file — the only skill-adjacent
+    entry is `ProposeSkills`, an unrelated mechanism for proposing *new*
+    user-level skills from observed patterns. (2) `ClaudeAgentOptions.skills`
+    (the real SDK mechanism for enabling skills) discovers skills from
+    filesystem `SKILL.md` files under user/project settings and installed
+    plugins — its own docstring confirms this, not a built-in registry. (3)
+    A full search of every plugin marketplace skill, user-level skill, and
+    this project's own `.claude/` directory on the development machine found
+    29 installed skills (discord, telegram, frontend-design, skill-creator,
+    etc.) and zero pptx/docx/xlsx/office-document skill anywhere. A stronger
+    finding than AskUserQuestion's "reachable but unverified" — genuinely
+    absent, with no invocation path in the tool schema either. Superseded
+    the same way Excel and the PI concept were (see Decision Log): Slide
+    Generation Agent uses python-pptx directly (already a dependency —
+    `mcp_servers/ppt_mcp` uses it to PARSE `.pptx`; this uses it to WRITE
+    one) for fully deterministic rendering, with exactly one agentic call
+    (design PARAMETER selection at onboarding, never raw file manipulation).
+17. **A candidate's `flex_bounds` can be internally self-contradictory, and
+    the only place that caught it was deep inside the render code, mid-
+    draw.** The first real live run of `agents/slide_generation_agent`'s
+    Mode 1 crashed the whole discovery session: a candidate proposed
+    `row_height_in_min` (0.28) above the code's own default row padding —
+    a `ValueError` raised from inside `_fit_rows` at render time, with no
+    PM-facing message, ending the session. Fixed two ways together: (1)
+    `_validate_flex_bounds` now checks every candidate's `flex_bounds` for
+    internal consistency (all 3 levers — font size, row height, character
+    truncation) immediately after `_generate_candidates`'s agentic call
+    returns, before any render is attempted — the "verify mechanically-
+    checkable claims in code" convention (`docs/DECISION_LOG.md`), just not
+    applied here until this run surfaced the gap. (2) The 3 previously
+    inconsistent hardcoded row-padding defaults scattered across
+    `_draw_row_list`/`_draw_narrative_block`/`_draw_table_slide` (0.14 vs.
+    0.1) were consolidated into one shared `DEFAULT_ROW_PADDING_IN` — that
+    inconsistency is exactly what let an invalid candidate look "accidentally
+    valid" against one drawer's default while violating another's. A bad
+    candidate now fails the **whole batch**, deliberately not a silent
+    per-candidate drop — see `docs/DECISION_LOG.md` for why this is a
+    different case from the already-existing "one candidate hits
+    `SlideFitError`, drop it and continue" handling, not the same situation
+    twice.
+18. **Validating a constraint in code doesn't help if the prompt never told
+    the model the actual number it needs to satisfy.** A second live Mode 1
+    run hit the same failure category as gotcha #17 — `_validate_flex_bounds`
+    caught it correctly, whole-batch-failed as designed — but with a
+    different guessed `row_height_in_min` (0.24, vs. the first run's 0.28),
+    both wildly above the real `DEFAULT_ROW_PADDING_IN` (0.12). Root cause:
+    `DESIGN_SYSTEM_PROMPT` described the constraint in prose ("a real
+    compression from a comfortable default row spacing") but never stated
+    the actual number being compared against. Unlike `font_size_pt_min` and
+    `display_text_max_chars_min` — each compared against a value the model
+    proposes itself in the *same* response (`body_size_pt`,
+    `display_text_max_chars_default`), trivially self-satisfiable —
+    `row_height_in_min`'s comparison point lives only in code. The model
+    was blind-guessing at an anchor it was never shown, so the check was
+    always going to keep failing regardless of how many more live attempts
+    were run. Fixed by turning `DESIGN_SYSTEM_PROMPT` into an f-string that
+    interpolates the real `DEFAULT_ROW_PADDING_IN` value directly (never a
+    second, separately hardcoded number that could drift from the actual
+    constant), plus a concrete target range. A code-level check catching a
+    violation correctly is not the same as the constraint being satisfiable
+    by the party being asked to meet it — when a check keeps failing across
+    multiple live runs, verify the prompt actually states what's being
+    checked before assuming the model is unreliable.
 
 ## Coding conventions established so far
 - Python throughout except `ado_mcp` (forced Node.js — no Python
