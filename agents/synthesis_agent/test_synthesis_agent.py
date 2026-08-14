@@ -18,6 +18,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent))
 import synthesis_agent as sa  # noqa: E402
@@ -200,6 +201,57 @@ def run_structural_checks():
         print("  PASS  missing skill fails loudly (no silent fallback to a default)")
 
 
+async def run_isolation_mode_test():
+    """Mechanically proves the SDK-isolation fix (CLAUDE.md 'Known gotchas' CRITICAL entry)
+    is wired on every ClaudeAgentOptions this file constructs — no credentials needed,
+    query() is mocked so nothing hits the network. Covers all 4 real query() call sites:
+    curate_report (+ its auto-triggered compression-faithfulness judge) and
+    write_executive_summary (+ its auto-triggered summary-quality judge), both routed
+    through the shared _run_agentic_call."""
+    print("\nSDK isolation mode — mechanical proof (no credentials, query() is mocked):")
+
+    from claude_agent_sdk.types import ResultMessage
+
+    captured_options: list[Any] = []
+
+    async def _fake_query(*, prompt, options):
+        captured_options.append(options)
+        n = len(captured_options)
+        if n == 1:  # curate_report's own call
+            structured_output = {"deduped_initiatives": [], "curated_features": [], "curated_initiatives": []}
+        elif n == 2:  # compression-faithfulness judge, auto-triggered
+            structured_output = {"score": 0.9, "explanation": "fine"}
+        elif n == 3:  # write_executive_summary's own call
+            structured_output = {"executive_summary": "s", "trend_line": ""}
+        else:  # summary-quality judge, auto-triggered
+            structured_output = {"groundedness_score": 0.9, "coherence_score": 0.9, "explanation": "fine"}
+        yield ResultMessage(
+            subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+            num_turns=1, session_id="fake", structured_output=structured_output,
+        )
+
+    original_query = sa.query
+    sa.query = _fake_query
+    try:
+        rag_rollup_result = compute_rag_rollup([_feature(1, "On Track", ["x"])])
+        curation = await curate_report([_feature(1, "On Track", ["x"])], [], rag_rollup_result, None, TEST_PROJECT_ID, SKILLS_ROOT)
+        await write_executive_summary(curation["curated_features"], curation["curated_initiatives"], rag_rollup_result, None, TEST_PROJECT_ID, SKILLS_ROOT)
+
+        assert len(captured_options) == 4, (
+            f"expected exactly 4 real query() calls (curate_report + its judge, "
+            f"write_executive_summary + its judge), got {len(captured_options)}"
+        )
+        for i, opts in enumerate(captured_options):
+            assert opts.setting_sources == [], f"call {i}: expected setting_sources=[], got {opts.setting_sources}"
+            assert opts.skills == [], f"call {i}: expected skills=[], got {opts.skills}"
+            assert opts.strict_mcp_config is True, f"call {i}: expected strict_mcp_config=True, got {opts.strict_mcp_config}"
+        print("  PASS  ALL 4 real query() calls (curate_report + compression-faithfulness judge, "
+              "write_executive_summary + summary-quality judge) carry setting_sources=[], skills=[], "
+              "strict_mcp_config=True (SDK isolation mode)")
+    finally:
+        sa.query = original_query
+
+
 async def run_risk_floor_violation_test():
     """Proves the safety net actually catches something — same instinct as feature_agent's
     per-item failure isolation test. Mocks _run_agentic_call to simulate the model
@@ -215,7 +267,7 @@ async def run_risk_floor_violation_test():
     ]
     rag_rollup_result = compute_rag_rollup(features)
 
-    async def _bad_agentic_call(prompt, system_prompt, schema, model, max_turns, caller_name):
+    async def _bad_agentic_call(prompt, system_prompt, schema, model, max_turns, caller_name, judge=None, judge_name=None):
         # Simulates the model dropping BOTH a Blocked and a Needs Human Review Feature —
         # exactly the violation the floor exists to catch.
         return {
@@ -376,6 +428,7 @@ async def main():
     run_part_a_tests()
     run_revision_feedback_tests()
     run_structural_checks()
+    await run_isolation_mode_test()  # no credentials needed — query() is mocked
     await run_risk_floor_violation_test()  # no credentials needed — the agentic call is mocked
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "common"))
+import observability as obs  # noqa: E402
 from mcp_client import open_mcp_client  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "agents" / "feature_agent"))
@@ -87,97 +88,115 @@ async def run_pipeline(
     nested whole (including features, initiatives, prior_week), not a trimmed subset;
     Review Gate (not yet built) will need the full picture, not just summary fields.
     """
+    # Tracing is opt-in (ARIZE_SPACE_ID/ARIZE_API_KEY env vars) and fully best-effort —
+    # init_tracing() never raises. Called once, here, at the real entry point every real
+    # run goes through — see common/observability.py's own docstring for why this and
+    # every traced_span/safe_eval_call site downstream of it is structurally incapable of
+    # changing this function's real return value or raising an exception of its own.
+    obs.init_tracing(project_name=project_id, debug=debug)
+
     input_config = {"ado_org": ado_org, "ado_project": ado_project, "reports_dir": reports_dir}
 
-    # Step 0: ensure_project MUST run before save_report_snapshot — project_id is an FK
-    # on weekly_reports. Run it first, not last, so a DB connectivity problem fails fast,
-    # before any real (billed) API calls happen.
-    await _ensure_project(project_id, name, input_config, database_url)
-    if debug:
-        print(f"[orchestrator debug] ensure_project('{project_id}') done\n")
+    # CHAIN, not AGENT: run_pipeline() is deterministic coordination (Requirement/CLAUDE.md's
+    # own framing — "Orchestrator delegates, never decides content"), not an autonomous
+    # reasoning loop itself (the individual LLM-kind spans nested under it are). Every
+    # traced_span opened inside this block (in every agent this function calls, and in
+    # mcp_client.py's call()) nests under this one automatically via OpenTelemetry's own
+    # context propagation (start_as_current_span) — no explicit parent-passing needed, which
+    # is exactly what gives Arize one connected trace per real run instead of disconnected
+    # spans.
+    with obs.traced_span(f"run_pipeline.{project_id}", "CHAIN", {
+        "singleslide.project_id": project_id, "singleslide.week_of": week_of,
+    }):
+        # Step 0: ensure_project MUST run before save_report_snapshot — project_id is an FK
+        # on weekly_reports. Run it first, not last, so a DB connectivity problem fails fast,
+        # before any real (billed) API calls happen.
+        await _ensure_project(project_id, name, input_config, database_url)
+        if debug:
+            print(f"[orchestrator debug] ensure_project('{project_id}') done\n")
 
-    # Step 1: Feature Agent. Per-item failures are already absorbed here (downgraded to
-    # Needs Human Review, never raised) — nothing extra needed at this level.
-    features = await investigate_all_committed_features(
-        ado_org, ado_project, ado_pat_base64, project_id, skills_root, model,
-    )
-    if debug:
-        print(f"[orchestrator debug] feature_agent: {len(features)} Feature(s) investigated\n")
-
-    # Step 2: Status Report Agent — shape-translate existing_features first.
-    existing_features = _existing_features_for_status_report_agent(features)
-    status_reports = await investigate_all_status_reports(
-        reports_dir, existing_features, project_id, skills_root, model,
-    )
-    if debug:
-        print(f"[orchestrator debug] status_report_agent: {len(status_reports)} report(s) investigated\n")
-
-    # Step 3: flatten across every team lead's report — Synthesis needs the combined
-    # view (Requirement 9's fan-in), not one report at a time.
-    enrichments = [e for r in status_reports for e in r["potential_enrichments"]]
-    initiatives = [i for r in status_reports for i in r["other_initiatives"]]
-
-    # Step 4: Synthesis + Critique, bounded revision loop.
-    report: dict[str, Any] = {}
-    critique_result: dict[str, Any] = {}
-    revision_feedback: Optional[list[dict[str, Any]]] = None
-    attempt = 0
-    while True:
-        attempt += 1
-        report = await synthesize_report(
-            project_id, week_of, features, enrichments, initiatives, database_url,
-            skills_root, model, debug=debug, revision_feedback=revision_feedback,
+        # Step 1: Feature Agent. Per-item failures are already absorbed here (downgraded to
+        # Needs Human Review, never raised) — nothing extra needed at this level.
+        features = await investigate_all_committed_features(
+            ado_org, ado_project, ado_pat_base64, project_id, skills_root, model,
         )
-        critique_result = await critique_report(report, project_id, skills_root, model)
         if debug:
-            print(f"[orchestrator debug] attempt {attempt}: critique passed={critique_result['passed']}\n")
+            print(f"[orchestrator debug] feature_agent: {len(features)} Feature(s) investigated\n")
 
-        if critique_result["passed"]:
-            break
+        # Step 2: Status Report Agent — shape-translate existing_features first.
+        existing_features = _existing_features_for_status_report_agent(features)
+        status_reports = await investigate_all_status_reports(
+            reports_dir, existing_features, project_id, skills_root, model,
+        )
+        if debug:
+            print(f"[orchestrator debug] status_report_agent: {len(status_reports)} report(s) investigated\n")
 
-        risk_floor_check = next(c for c in critique_result["checks"] if c["criterion"] == "risk_floor")
-        if not risk_floor_check["passed"]:
-            # Structurally should be impossible: curate_report's own validation runs on
-            # every call (including revisions) and raises before ever returning a report
-            # with a risk-floor violation. If critique's independent re-check disagrees,
-            # that disagreement — not any content judgment — is the problem. Hard stop,
-            # BEFORE save_report_snapshot is ever reached below: the report's
-            # trustworthiness is unknown, and it must never be persisted in that state.
-            # See docs/DECISION_LOG.md ("a code-enforced check failing after independent
-            # re-verification is a bug, not a content judgment call").
-            raise RuntimeError(
-                "critique_report's risk_floor re-check failed even though synthesize_report "
-                "completed successfully — curate_report's own validation should have caught "
-                "this first. This indicates a real bug (a disagreement between curate_report's "
-                "and critique_report's risk-floor logic), not expected critique variance. "
-                f"Refusing to save. checks: {critique_result['checks']}"
+        # Step 3: flatten across every team lead's report — Synthesis needs the combined
+        # view (Requirement 9's fan-in), not one report at a time.
+        enrichments = [e for r in status_reports for e in r["potential_enrichments"]]
+        initiatives = [i for r in status_reports for i in r["other_initiatives"]]
+
+        # Step 4: Synthesis + Critique, bounded revision loop.
+        report: dict[str, Any] = {}
+        critique_result: dict[str, Any] = {}
+        revision_feedback: Optional[list[dict[str, Any]]] = None
+        attempt = 0
+        while True:
+            attempt += 1
+            report = await synthesize_report(
+                project_id, week_of, features, enrichments, initiatives, database_url,
+                skills_root, model, debug=debug, revision_feedback=revision_feedback,
             )
+            critique_result = await critique_report(report, project_id, skills_root, model)
+            if debug:
+                print(f"[orchestrator debug] attempt {attempt}: critique passed={critique_result['passed']}\n")
 
-        if attempt > max_revisions:
-            break
+            if critique_result["passed"]:
+                break
 
-        revision_feedback = [c for c in critique_result["checks"] if not c["passed"]]
+            risk_floor_check = next(c for c in critique_result["checks"] if c["criterion"] == "risk_floor")
+            if not risk_floor_check["passed"]:
+                # Structurally should be impossible: curate_report's own validation runs on
+                # every call (including revisions) and raises before ever returning a report
+                # with a risk-floor violation. If critique's independent re-check disagrees,
+                # that disagreement — not any content judgment — is the problem. Hard stop,
+                # BEFORE save_report_snapshot is ever reached below: the report's
+                # trustworthiness is unknown, and it must never be persisted in that state.
+                # See docs/DECISION_LOG.md ("a code-enforced check failing after independent
+                # re-verification is a bug, not a content judgment call").
+                raise RuntimeError(
+                    "critique_report's risk_floor re-check failed even though synthesize_report "
+                    "completed successfully — curate_report's own validation should have caught "
+                    "this first. This indicates a real bug (a disagreement between curate_report's "
+                    "and critique_report's risk-floor logic), not expected critique variance. "
+                    f"Refusing to save. checks: {critique_result['checks']}"
+                )
+
+            if attempt > max_revisions:
+                break
+
+            revision_feedback = [c for c in critique_result["checks"] if not c["passed"]]
+            if debug:
+                print(f"[orchestrator debug] revising (attempt {attempt + 1}/{max_revisions + 1}), "
+                      f"feedback: {revision_feedback}\n")
+
+        reviewed = critique_result["passed"]
+
+        # Step 5: persist. Always reached when we get here (the risk-floor hard stop above
+        # raises before this point, so it never does) — Review Gate (Requirement 18) is the
+        # real human safety net; a report that never fully passed critique should still
+        # reach a human, flagged, not vanish.
+        save_result = await _save_report_snapshot(project_id, report, database_url)
         if debug:
-            print(f"[orchestrator debug] revising (attempt {attempt + 1}/{max_revisions + 1}), "
-                  f"feedback: {revision_feedback}\n")
+            print(f"[orchestrator debug] save_report_snapshot: report_id={save_result['report_id']}\n")
 
-    reviewed = critique_result["passed"]
-
-    # Step 5: persist. Always reached when we get here (the risk-floor hard stop above
-    # raises before this point, so it never does) — Review Gate (Requirement 18) is the
-    # real human safety net; a report that never fully passed critique should still
-    # reach a human, flagged, not vanish.
-    save_result = await _save_report_snapshot(project_id, report, database_url)
-    if debug:
-        print(f"[orchestrator debug] save_report_snapshot: report_id={save_result['report_id']}\n")
-
-    return {
-        "project_id": project_id,
-        "week_of": week_of,
-        "report_id": save_result["report_id"],
-        "rag_status": report["rag_status"],
-        "reviewed": reviewed,
-        "attempts": attempt,
-        "critique": critique_result,
-        "report": report,
-    }
+        return {
+            "project_id": project_id,
+            "week_of": week_of,
+            "report_id": save_result["report_id"],
+            "rag_status": report["rag_status"],
+            "reviewed": reviewed,
+            "attempts": attempt,
+            "critique": critique_result,
+            "report": report,
+        }

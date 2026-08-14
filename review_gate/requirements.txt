@@ -1,3 +1,14 @@
 mcp>=1.29.0
 python-pptx==1.0.2
 pyyaml>=6.0
+
+# Observability (common/observability.py) — optional, and only reached indirectly via
+# common/mcp_client.py's call() (TOOL spans on the two Archive tools this component
+# calls); review_gate/ makes no LLM calls of its own. Tracing only activates when
+# ARIZE_SPACE_ID/ARIZE_API_KEY are set, and every call site degrades gracefully (no
+# exception, tracing silently stays off) if these aren't installed at all.
+arize-otel>=0.13.0
+opentelemetry-sdk>=1.44.0
+opentelemetry-exporter-otlp-proto-grpc>=1.44.0
+openinference-semantic-conventions>=0.1.32
+openinference-instrumentation>=0.1.57

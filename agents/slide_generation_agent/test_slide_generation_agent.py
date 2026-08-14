@@ -480,6 +480,42 @@ async def run_discovery_integration_tests(skills_root: str):
         sga._build_and_save = real_build_and_save
 
 
+async def run_isolation_mode_test():
+    """Mechanically proves the SDK-isolation fix (CLAUDE.md 'Known gotchas' CRITICAL entry)
+    is wired on Mode 1's one real query() call site (_run_agentic_call, shared by
+    _generate_candidates) — no credentials needed, query() is mocked so nothing hits the
+    network."""
+    print("\nSDK isolation mode — mechanical proof (no credentials, query() is mocked):")
+
+    from claude_agent_sdk.types import ResultMessage
+
+    captured_options = []
+
+    async def _fake_query(*, prompt, options):
+        captured_options.append(options)
+        yield ResultMessage(
+            subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+            num_turns=1, session_id="fake", structured_output={"ok": True},
+        )
+
+    original_query = sga.query
+    sga.query = _fake_query
+    try:
+        await sga._run_agentic_call(
+            prompt="test", system_prompt="test", schema={"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"], "additionalProperties": False},
+            model="claude-sonnet-5", max_turns=3, caller_name="test",
+        )
+        assert len(captured_options) == 1, f"expected exactly 1 real query() call, got {len(captured_options)}"
+        opts = captured_options[0]
+        assert opts.setting_sources == [], f"expected setting_sources=[], got {opts.setting_sources}"
+        assert opts.skills == [], f"expected skills=[], got {opts.skills}"
+        assert opts.strict_mcp_config is True, f"expected strict_mcp_config=True, got {opts.strict_mcp_config}"
+        print("  PASS  _run_agentic_call's real query() call carries setting_sources=[], skills=[], "
+              "strict_mcp_config=True (SDK isolation mode)")
+    finally:
+        sga.query = original_query
+
+
 async def main():
     print("Slide Generation Agent — test suite\n")
     run_fit_heuristic_tests()
@@ -487,6 +523,7 @@ async def main():
     run_design_prompt_tests()
     run_design_helper_tests()
     run_default_ask_human_tests()
+    await run_isolation_mode_test()
     await run_generate_candidates_validation_regression_test()
 
     with tempfile.TemporaryDirectory() as skills_root:

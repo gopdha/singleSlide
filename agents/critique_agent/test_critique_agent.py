@@ -17,8 +17,10 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent))
+import critique_agent as ca  # noqa: E402
 from critique_agent import (  # noqa: E402
     CRITIQUE_SCHEMA,
     _grounding_coverage_check,
@@ -119,6 +121,43 @@ def run_structural_checks():
         print("  PASS  missing skill fails loudly (no silent fallback to a default)")
 
 
+async def run_isolation_mode_test():
+    """Mechanically proves the SDK-isolation fix (CLAUDE.md 'Known gotchas' CRITICAL entry)
+    is wired on critique_report's real query() call — no credentials needed, query() is
+    mocked so nothing hits the network."""
+    print("\nSDK isolation mode — mechanical proof (no credentials, query() is mocked):")
+
+    from claude_agent_sdk.types import ResultMessage
+
+    captured_options: list[Any] = []
+
+    async def _fake_query(*, prompt, options):
+        captured_options.append(options)
+        yield ResultMessage(
+            subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+            num_turns=1, session_id="fake",
+            structured_output={"checks": [], "overall_feedback": "fine"},
+        )
+
+    original_query = ca.query
+    ca.query = _fake_query
+    try:
+        features = [_feature(1, "On Track", "A")]
+        curated = [_curated(1, "On Track", "A")]
+        report = _sample_report("Everything is on track.", curated, features)
+        await critique_report(report, TEST_PROJECT_ID, SKILLS_ROOT)
+
+        assert len(captured_options) == 1, f"expected exactly 1 real query() call, got {len(captured_options)}"
+        opts = captured_options[0]
+        assert opts.setting_sources == [], f"expected setting_sources=[], got {opts.setting_sources}"
+        assert opts.skills == [], f"expected skills=[], got {opts.skills}"
+        assert opts.strict_mcp_config is True, f"expected strict_mcp_config=True, got {opts.strict_mcp_config}"
+        print("  PASS  critique_report's real query() call carries setting_sources=[], skills=[], "
+              "strict_mcp_config=True (SDK isolation mode)")
+    finally:
+        ca.query = original_query
+
+
 def _sample_report(executive_summary: str, curated_features: list[dict], features: list[dict]) -> dict:
     return {
         "project_id": TEST_PROJECT_ID, "week_of": "2026-08-16", "rag_status": "Red",
@@ -188,6 +227,7 @@ async def main():
     print("Critique Agent — test suite\n")
     run_code_check_tests()
     run_structural_checks()
+    await run_isolation_mode_test()  # no credentials needed — query() is mocked
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:

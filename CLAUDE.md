@@ -132,7 +132,12 @@ full breakdown.
 mcp_servers/    ado_mcp (Node.js, official MS package — no Python equivalent
                 exists) + ppt_mcp (Python)
 common/         mcp_client.py (shared MCP client — every agent uses this,
-                not its own connection code) + skill_loader.py
+                not its own connection code) + skill_loader.py +
+                observability.py (Arize/OpenTelemetry tracing + LLM-judge
+                quality scoring — best-effort, structurally incapable of
+                breaking a caller's real return value or swallowing a
+                caller's real exception; see Build Status and "Known
+                gotchas" #19)
 skills/         generated per-project SKILL.md files
 agents/         feature_agent, status_report_agent, synthesis_agent,
                 critique_agent, slide_generation_agent, discovery_agent
@@ -153,6 +158,7 @@ docs/           this file + DECISION_LOG.md + BACKLOG.md
 | Component | Status |
 |---|---|
 | `common/mcp_client.py`, `common/skill_loader.py` | ✅ Done, tested |
+| `common/observability.py` | ✅ **Done, structurally proven, then wired into all 6 agentic-call files + `mcp_client.py` + `orchestrator.py`.** Arize-only tracing over OpenTelemetry/OpenInference — no Postgres storage, no CLI report; all review happens in Arize's own dashboards. Non-negotiable design principle, PROVEN mechanically (not just asserted): a broken/absent Arize connection, missing credentials, or a failing quality-judge call can never change `run_pipeline()`'s real return value or swallow a real business exception — `traced_span`'s own shape enforces this (only span setup/teardown is wrapped in try/except; the caller's real code inside the `yield` is untouched), proven by 15 tests forcing every distinct failure mode (tracer never initialized, `start_as_current_span` raising, `set_attribute` raising, a judge coroutine raising) and confirming a wrapped function's real return value and a genuine `RuntimeError` both survive unaffected. One root `CHAIN`-kind span per `run_pipeline()` run (a judgment call, not a verified fact — OpenInference's own enum doesn't document which kind fits a deterministic-coordination root; logged as a judgment call, not asserted as verified, in `docs/DECISION_LOG.md`); every other agentic call site nests under it automatically via OTel's own context propagation. 4 new LLM-judge quality scores, attached via the real, verified `openinference.instrumentation.get_evaluation_attributes` Annotations/Evaluations mechanism (distinct from regular span attributes) onto the SAME span as the call being judged: `feature_agent` groundedness, `status_report_agent` extraction faithfulness (judged against the real `parse_slide` source, captured off the message stream — see "Known gotchas" below), `synthesis_agent` Part B compression faithfulness and Part C groundedness+coherence (the only 2-score judge in the system — every `synthesize_report()` attempt is scored, not just the final persisted one; the marginal cost of that choice is ~$0.014, only on weeks that actually revise, in exchange for real before/after data on whether revision helps, which the project didn't have before). `critique_agent` and `slide_generation_agent` Mode 1 are traced but deliberately NOT scored in v1. A real gap was found and fixed during this build, not before — see "Known gotchas" #19. All 6 previously shipped agent files' + `mcp_client.py`'s + `orchestrator.py`'s own existing test suites re-run afterward with zero regressions (one test needed updating: a mock of `synthesis_agent._run_agentic_call` that didn't yet accept the new optional `judge`/`judge_name` kwargs) |
 | `mcp_servers/ado_mcp`, `mcp_servers/ppt_mcp` | ✅ Carried over, previously verified (`ppt_mcp` needed a real fix during Status Report Agent's live verification — see "Known gotchas" below) |
 | `agents/feature_agent` | ✅ **Done, fully live-verified** against a real ADO org and real Anthropic API — see "Known gotchas" below for 3 real bugs found and fixed during this |
 | `agents/status_report_agent` | ✅ **Done, fully live-verified** against a real Anthropic API and a real fixture report (exercised both Other-Initiative identification and enrichment-flagging, both `match_confidence` values) — see "Known gotchas" below for 2 real bugs found and fixed during this |
@@ -401,6 +407,104 @@ docs/           this file + DECISION_LOG.md + BACKLOG.md
     by the party being asked to meet it — when a check keeps failing across
     multiple live runs, verify the prompt actually states what's being
     checked before assuming the model is unreliable.
+19. **A fail-safe wrapper's OWN helper functions can bypass its fail-safe
+    protection if they're called as ARGUMENTS to the wrapper, not from
+    inside it.** Found during `common/observability.py`'s own build, before
+    any of the 6 agent files were touched — the design review that caught
+    it was the same "prove it, don't assert it" instinct the test suite
+    itself was built around, not a live failure. `traced_span(name, kind,
+    obs.input_value_attribute(prompt))`-style call sites evaluate
+    `input_value_attribute(prompt)` as a plain Python argument *before*
+    `traced_span` is ever entered — so an unguarded `ImportError` inside
+    `input_value_attribute` (e.g. `openinference-semantic-conventions` not
+    installed) would raise straight into the caller, completely bypassing
+    `traced_span`'s own try/except, which only protects code that runs
+    *inside* it. This applied to every attribute-builder helper
+    (`input_value_attribute`, `output_value_attribute`,
+    `tool_span_attributes`, `llm_span_attributes`, `evaluation_attributes`)
+    — all 5 are called unconditionally at every instrumented call site,
+    tracing enabled or not. Fixed by wrapping each builder's own body in
+    try/except, returning `{}` (no attributes, not a crash) on any failure
+    — the same "return a safe default, never raise" contract `traced_span`
+    and `safe_eval_call` already had, just not yet extended to these. A
+    dedicated regression test forces the realistic version of this failure
+    (`sys.modules["openinference..."] = None`, not just missing
+    credentials) and confirms all 5 builders return `{}` rather than
+    raising. General lesson for this pattern specifically: a fail-safe
+    wrapper's guarantee only covers code that runs *inside* the wrapper —
+    anything a caller must evaluate to construct the wrapper's own
+    arguments needs its own, independent fail-safe treatment.
+20. **CRITICAL, FULLY RESOLVED (full-pipeline confirmed) — every agentic
+    call site was silently running as a full interactive Claude Code
+    session, inflating real per-run cost by roughly 10x, until
+    observability's first live trace caught it.** None
+    of the 6 agentic-call files (`feature_agent`, `status_report_agent`,
+    `synthesis_agent` — 3 call sites, `critique_agent`,
+    `slide_generation_agent`) ever set `setting_sources`, `skills`, or
+    `strict_mcp_config` on their `ClaudeAgentOptions`. All three default to
+    "behave like a full interactive CLI session" — confirmed from the
+    installed SDK's own docstrings: `setting_sources=None` loads CLAUDE.md
+    and every filesystem settings source ("all sources loaded, matches CLI
+    defaults"); `skills=None` is explicitly documented as "not 'skills
+    off'"; `strict_mcp_config=False` lets the CLI load additional
+    project/user/plugin MCP configuration beyond what the call itself
+    passed in. None of these narrow, schema-constrained, self-contained
+    calls were ever designed to need any of that. Found from real evidence,
+    not suspicion: a live trace reported 14.73k tokens but $2.83 cost —
+    arithmetic at real Sonnet pricing put that token count at 10-20 cents,
+    off by an order of magnitude — cross-checked against the user's own
+    real Anthropic billing console table (~30 Sonnet calls averaging ~38k
+    input tokens each, confirming Arize's cost reporting was accurate and
+    the real bug was inflated actual usage, not a tracing bug). Fixed with
+    `setting_sources=[]`, `skills=[]`, `strict_mcp_config=True` — "SDK
+    isolation mode" — on every `ClaudeAgentOptions` construction site in
+    all 6 files (12 sites total), each backed by a mechanical,
+    credential-free `run_isolation_mode_test` (module-level `query`
+    monkeypatched, isolation fields asserted on the captured options) and
+    each file's full pre-existing test suite re-run afterward with zero
+    regressions. **The fix itself caused a real regression, in the same
+    failure SHAPE as gotcha #10 but a different cause**: under isolation
+    mode, tool schemas aren't preloaded into context, so the first turn of
+    any real-MCP-tool call becomes a mandatory ToolSearch discovery step —
+    real and confirmed live, not theorized. `feature_agent.py`'s system
+    prompt gave an EXACT turn-by-turn budget (`max_turns=5`, zero slack)
+    written before this discovery-turn cost existed; the isolation fix
+    that removed ~10x of unwanted context simultaneously introduced a real
+    turn cost the old budget had no room for, and a previously-passing
+    live run on the same Feature (#8) failed with `error_max_turns`
+    immediately after the fix. Fixed by bumping `max_turns` 5→6 and naming
+    turn 1 as discovery explicitly in the prompt. Verified this was NOT a
+    universal fix rather than assuming it: `status_report_agent.py` already
+    had `max_turns=6` with ample headroom (3 needed turns) so no number
+    changed; `synthesis_agent.py`, `critique_agent.py`, and
+    `slide_generation_agent.py` Mode 1 are all zero-tool calls
+    (`allowed_tools=[]`, no `mcp_servers`) so the discovery turn doesn't
+    apply to any of them at all. Single-file result, billing-confirmed:
+    a real live `feature_agent.py` run against the real Anthropic API cost
+    $0.24 ($4.10→$4.34 on the real billing console), a ~63% reduction from
+    the ~$0.65 pre-fix baseline for the same call shape. **Then
+    full-pipeline confirmed with a real `run_singleslide.py` run across
+    Feature Agent, Status Report Agent, Synthesis Agent, and Critique
+    Agent together (Slide Generation not exercised in this run)**: zero
+    `error_max_turns` anywhere on Synthesis/Critique across a real
+    two-attempt revision cycle (confirming the zero-tool-call reasoning
+    above held live, not just on paper); the revision loop itself worked
+    correctly end-to-end (a genuine jargon-leak finding on attempt 1,
+    clean pass on attempt 2, `report_id=13`/`reviewed=true`/`attempts=2`);
+    real cost $4.34→$5.29 ($0.95, explainable by the revision cycle
+    roughly doubling the Synthesis+Critique portion and Slide Generation
+    being excluded from this run's scope — not a red flag); and a second,
+    independent measurement system (Arize's own trace cost for the same
+    `run_pipeline()` root span) confirmed the same direction and rough
+    magnitude of reduction ($2.827862→$1.616024, ~43%) via a completely
+    different cost-attribution mechanism than Anthropic's billing ledger.
+    This invalidates this project's original ~$0.29/run design-time cost
+    estimate (docs/DECISION_LOG.md) — that figure was never verified
+    against real billing until this. See docs/DECISION_LOG.md's full
+    writeup ("The real per-run cost was ~10x the design-time estimate")
+    for the complete story, including the SDK source evidence that ruled
+    out (not confirmed) a competing hypothesis that `strict_mcp_config`
+    broke the npx-spawned ADO MCP subprocess's own env/PATH resolution.
 
 ## Coding conventions established so far
 - Python throughout except `ado_mcp` (forced Node.js — no Python

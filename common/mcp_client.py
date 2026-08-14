@@ -6,11 +6,16 @@ first pass of this project; this is the one copy, shared.
 """
 import json
 import re
+import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any, Optional
 
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
+
+sys.path.insert(0, str(Path(__file__).parent))
+import observability as obs  # noqa: E402
 
 # Some MCP servers (the official ADO one, notably) wrap tool results in an
 # untrusted-content delimiter banner as their own prompt-injection defense —
@@ -45,23 +50,32 @@ class _McpClient:
         self._session = session
 
     async def call(self, tool_name: str, arguments: dict[str, Any]) -> Any:
-        result = await self._session.call_tool(tool_name, arguments)
-        text_block = next((b for b in result.content if hasattr(b, "text")), None)
-        if text_block is None:
-            return None
-        text = text_block.text
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            pass
-        # Try stripping an untrusted-content delimiter wrapper, if present.
-        match = _UNTRUSTED_WRAPPER_RE.match(text)
-        if match:
+        with obs.traced_span(
+            f"mcp.{tool_name}", "TOOL", obs.tool_span_attributes(tool_name, "", arguments),
+        ) as span:
+            result = await self._session.call_tool(tool_name, arguments)
+            text_block = next((b for b in result.content if hasattr(b, "text")), None)
+            if text_block is None:
+                span.set_attributes(obs.output_value_attribute(None))
+                return None
+            text = text_block.text
             try:
-                return json.loads(match.group(1))
+                parsed = json.loads(text)
+                span.set_attributes(obs.output_value_attribute(parsed))
+                return parsed
             except json.JSONDecodeError:
                 pass
-        return text  # genuinely not JSON — some tools legitimately return plain text
+            # Try stripping an untrusted-content delimiter wrapper, if present.
+            match = _UNTRUSTED_WRAPPER_RE.match(text)
+            if match:
+                try:
+                    parsed = json.loads(match.group(1))
+                    span.set_attributes(obs.output_value_attribute(parsed))
+                    return parsed
+                except json.JSONDecodeError:
+                    pass
+            span.set_attributes(obs.output_value_attribute(text))
+            return text  # genuinely not JSON — some tools legitimately return plain text
 
     async def list_tools(self) -> list[str]:
         tools = await self._session.list_tools()

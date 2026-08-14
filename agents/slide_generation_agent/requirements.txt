@@ -1,3 +1,14 @@
 claude-agent-sdk>=0.2.0
 pyyaml>=6.0
 python-pptx==1.0.2
+
+# Observability (common/observability.py) — optional, and only wired into Mode 1
+# (_generate_candidates); Mode 2's render_report is fully deterministic and never touches
+# this. Tracing only activates when ARIZE_SPACE_ID/ARIZE_API_KEY are set, and every call
+# site degrades gracefully (no exception, tracing silently stays off) if these aren't
+# installed at all.
+arize-otel>=0.13.0
+opentelemetry-sdk>=1.44.0
+opentelemetry-exporter-otlp-proto-grpc>=1.44.0
+openinference-semantic-conventions>=0.1.32
+openinference-instrumentation>=0.1.57

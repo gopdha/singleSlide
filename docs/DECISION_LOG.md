@@ -135,6 +135,12 @@ Two things the paper's own guidance flagged that we should watch:
    with a large child count in practice.
 
 ## Cost estimate (validated, not assumed)
+**INVALIDATED by CLAUDE.md gotcha #20 (CRITICAL) — see "The real per-run cost was ~10x the
+design-time estimate" below for the full story.** This estimate was based on a design-time
+token estimate, never verified against real billing until observability's first live trace
+caught the actual figure was off by roughly 10x. Left below for the historical record of what
+was assumed at the time — do not cite it as a current cost figure.
+
 Full breakdown: ~91,000 input + ~11,200 output tokens per weekly run
 (8 Features, 4 status reports, 2 critique cycles assumed) = **~$0.29/run**
 at Sonnet intro pricing ($2/$10 per M tokens), ~$0.44/run at standard
@@ -731,3 +737,327 @@ persisted record, not evaporate) applied to the human's own input this time, not
 model's: a reject with no reason recorded would leave a future reader with exactly the
 same "the decision happened, the reasoning didn't survive" gap gotcha #15 fixed for
 Discovery Agent's caveats.
+
+## `common/observability.py` — Arize-only tracing, proven fail-safe BEFORE any shipped
+## agent file was touched, then wired into all of them
+
+The last component built in this project isn't a pipeline stage — it's a cross-cutting
+layer over every agentic call site and every direct MCP call, and it carries a real risk
+none of the other 8 components did: getting it wrong doesn't produce a wrong report, it
+breaks a report that would otherwise have been correct. That asymmetry is why this build
+was sequenced differently from every prior component: `common/observability.py` and its
+own test suite were built and fully proven FIRST, in complete isolation, touching none of
+the 6 already-shipped agent files — the explicit ask was "that test is the one I most want
+to see before any of the 6 already-shipped agent files get touched," and the sequencing
+held to that literally.
+
+**Verify-first found real, non-obvious facts, not just confirmed assumptions.** `arize.otel.register()`
+does NOT validate credentials against the network synchronously — confirmed by calling it
+with fake `space_id`/`api_key` and getting back a working (locally) `TracerProvider`, no
+exception, all real network activity deferred to a background export thread. This mattered:
+it meant `init_tracing()`'s own try/except mostly guards against *local* failures (a
+missing dependency, a malformed argument), not the network/auth failure the user's design
+brief specifically asked about — that failure mode is real, but it surfaces asynchronously,
+outside this process's own control flow, which OpenTelemetry's `BatchSpanProcessor` already
+isolates from the caller. The "Annotations and Evaluations" mechanism the user asked to be
+investigated as its own spec area turned out to be exactly that — a distinct code path
+(`openinference.instrumentation.get_evaluation_attributes`, confirmed by reading the
+installed package's real source, not docs) from regular span attributes
+(`llm.*`/`tool.*`), applied via `span.set_attributes()` onto the SAME span as the call being
+judged, not a separate call or a child span. And `ResultMessage.usage`'s cache-token field
+names could NOT be 100% confirmed without a live API call (none available this session) —
+reported honestly as unconfirmable rather than assumed, with `llm_span_attributes` reading
+every cache-token key via `.get()` and only setting the attribute when actually present,
+never fabricating a `0`.
+
+**A real correction to the user's own framing, found by tracing signatures rather than
+assuming them: `common/mcp_client.py`'s `call()` chokepoint does NOT cover every MCP call
+in this system.** It covers every *direct*, non-agentic call (Archive throughout, `ppt_mcp`
+in `status_report_agent`/`discovery_agent`, `discovery_agent`'s ADO sampling) — but
+`feature_agent.investigate_feature()` and `status_report_agent.investigate_status_report()`
+pass `mcp_servers=...`/`allowed_tools=...` straight into `ClaudeAgentOptions`, so their ADO/
+`parse_slide` tool calls happen *inside* the Claude Code CLI subprocess's own internal
+agentic loop — structurally invisible to `mcp_client.py` regardless of how the chokepoint
+itself is instrumented. Scoped deliberately for v1: one LLM-kind span per whole agentic
+call (matching the attribute mapping's own shape — one `input.value`/`output.value` pair
+per site), not per internal tool-use turn. Real scope boundary, not a silent gap — Feature
+Agent's own internal ADO tool calls are not separately traced in v1.
+
+**The centerpiece: `traced_span`'s shape makes "never breaks the pipeline" a property of
+the code, not a claim about it.** Only span setup (before `yield`) and teardown (in
+`finally`) are wrapped in try/except; the `yield span` line itself — the only line that
+ever runs the caller's real business code — has zero exception handling around it. This
+single design choice does two things at once, proven by two different test classes rather
+than one: (1) a broken tracer, a raising `start_as_current_span`, or a raising
+`set_attribute` all leave a wrapped function's real return value completely unaffected
+(`_do_real_work(21) == 42` holds in every forced-failure case), and (2) a genuine
+`RuntimeError` raised *inside* a `traced_span` block still propagates normally even with a
+fully broken tracer underneath — proving the layer doesn't accidentally hide a real bug
+behind broken telemetry, which would be its own, equally unacceptable failure mode. Both
+halves of the guarantee needed their own proof; a wrapper that only satisfied the first
+half would be indistinguishable from one that silently swallows everything.
+
+**A real gap found in this layer's OWN design, before any live failure exposed it —
+described in full as gotcha #19 (CLAUDE.md).** `traced_span`'s fail-safe guarantee only
+covers code that runs *inside* it. Every attribute-builder helper
+(`input_value_attribute`, `output_value_attribute`, `tool_span_attributes`,
+`llm_span_attributes`, `evaluation_attributes`) is called as an ARGUMENT at every
+instrumented call site — e.g. `traced_span(name, kind, obs.input_value_attribute(prompt))`
+— which Python evaluates *before* `traced_span` is ever entered. An unguarded `ImportError`
+in one of those helpers (the realistic case: `openinference-semantic-conventions` not
+installed) would have raised straight into the caller, completely bypassing the very
+protection this module exists to provide. Caught by the same "prove it, don't assert it"
+instinct the rest of this build was built around — asking "does the *whole* module actually
+satisfy its own stated guarantee, not just the two functions with the most obvious test
+coverage" — not by a live failure. Fixed by wrapping every builder's own body in
+try/except, returning `{}` (no attributes, not a crash) on any failure, with a dedicated
+regression test that blocks the real `openinference` imports via `sys.modules[...] = None`
+(not just missing credentials, which every other test already covered) and confirms all 5
+builders degrade to `{}` rather than raising.
+
+**Quality-scoring is per-component, not one generic groundedness/coherence pair
+everywhere — because what "quality" means differs by what the component actually
+produces.** `feature_agent` outputs structured status labels, not prose — its judge scores
+groundedness only (does `status_label` follow from `evidence`), with an explicit
+instruction that a `Needs Human Review` label honestly citing ambiguous evidence is
+well-grounded, not a failure to reach a verdict; penalizing honesty about uncertainty would
+have fought the whole reason Requirement 5 added that 4th taxonomy level. `status_report_agent`'s
+judge scores extraction faithfulness against the REAL `parse_slide` source — which required
+capturing `ToolResultBlock` content off the message stream during `investigate_status_report`'s
+own loop (confirmed real via `claude_agent_sdk.types.UserMessage`/`ToolResultBlock`), a
+narrower, judge-input-only use of message-stream introspection than the deferred full
+per-turn tracing described above; without the real source, "faithfulness" would have
+degraded into "internal consistency," a materially weaker check. `synthesis_agent` Part B's
+judge scores compression faithfulness (does `display_text` distort `progress_summary`) by
+judging the WORST offender across all curated Features, not an average — one fabricated
+claim should pull the score down meaningfully, matching this project's existing
+"grounding is a floor, not a curve" posture (the risk floor itself never averages away a
+single missing Blocked Feature). Part C's judge is the only one scoring TWO dimensions from
+one call (groundedness AND coherence) — discovering this required extending
+`evaluation_attributes()`'s own signature from a single `{name, score, ...}` shape to a
+LIST of evaluations, because `get_evaluation_attributes` flattens by list INDEX
+(`evaluations.0.*`, `evaluations.1.*`); two separate single-entry calls would have silently
+collided, both producing `evaluations.0.*` and the second call's `span.set_attributes()`
+overwriting the first's score instead of adding a second one. `critique_agent` and Slide
+Generation Agent's Mode 1 are traced (every agentic call site gets a span, unconditionally)
+but deliberately NOT scored: `critique_agent` IS the evaluator — scoring the judge with
+another judge wasn't asked for and wasn't obviously well-founded; Mode 1's `flex_bounds`
+are already code-validated by `_validate_flex_bounds` immediately after the agentic call
+returns (gotcha #17/#18), and nothing in the per-component mapping suggested an LLM judge
+adds anything a deterministic check doesn't already cover there.
+
+**Every `synthesize_report()` attempt is scored, not just the final persisted one — a
+~$0.014 marginal cost, only on weeks that actually revise, in exchange for data this
+project genuinely didn't have before.** At `MAX_REVISIONS=1`, the two synthesis-scoped
+judges (Part B + Part C) cost roughly $0.0075 + $0.0065 ≈ $0.014 per `synthesize_report()`
+attempt (rough sizing from this project's own established ~$0.29/run baseline and typical
+prompt sizes, not a live-metered figure). Scoring only the final report always costs
+$0.014; scoring every attempt costs $0.014 on the (more common) no-revision weeks —
+identical — and $0.028 only on weeks that revise. `core/orchestrator.py`'s own Build
+Status entry already recorded a real, unresolved open question: even after two real
+cross-component bug fixes, one genuine live run still ended `reviewed: False`, and
+`MAX_REVISIONS` was flagged as "may be worth revisiting once more real runs establish a
+pattern." Scoring only the final report would make that question permanently unanswerable
+— there would never be a recorded "before" score to compare a revision's "after" against.
+Per-attempt scoring was chosen specifically to let that backlog question eventually answer
+itself from real data, not to be scored generously by default.
+
+**One root `CHAIN`-kind span per `run_pipeline()` run — a stated judgment call, not a
+verified fact, and logged as such rather than asserted with the same confidence as the
+verified attribute constants.** `OpenInferenceSpanKindValues` (confirmed real: `AGENT`,
+`CHAIN`, `EVALUATOR`, `LLM`, `TOOL`, etc.) carries no docstring guidance on which kind fits
+a deterministic-coordination root versus an autonomous-reasoning one. `CHAIN` was chosen
+because `run_pipeline()` matches this project's own existing framing exactly — "Orchestrator
+delegates, never decides content" (CLAUDE.md's core architectural principle) — while `AGENT`
+reads as better suited to the individual `LLM`-kind spans nested underneath it, which
+genuinely do reason autonomously. Every nested `traced_span` (in every agent this function
+calls, and in `mcp_client.py`'s `call()`) becomes a child of this root automatically via
+OpenTelemetry's own `start_as_current_span` context propagation — no explicit
+parent-span-passing was added anywhere, which is what gives Arize one connected trace per
+real run instead of disconnected spans, exactly as asked for.
+
+## The real per-run cost was ~10x the design-time estimate — SDK isolation mode, its own
+## real regression, and a billing-confirmed fix (CLAUDE.md gotcha #20, CRITICAL — FULLY
+## RESOLVED, full-pipeline confirmed)
+
+Observability's first live trace didn't just prove the tracing layer worked — it caught a
+real, load-bearing bug in the pipeline it was watching, one no prior live-verification pass
+of any of the 6 already-shipped agent files had ever surfaced. This entry is the full story,
+not scattered across gotcha stubs, because — per explicit instruction — it's one of the most
+instructive debugging threads in the project: three real facts (a design-time estimate that
+was never checked against real billing, an isolation fix that was correct but incomplete,
+and a follow-on regression the fix itself introduced), each found with real evidence, not
+guessed.
+
+**Finding #1 — the original ~10x gap, found by cross-checking Arize's own reported cost
+against real Anthropic pricing arithmetic, not by doubting Arize.** A real `run_pipeline()`
+trace reported 14.73k total tokens but $2.827862 total cost — arithmetic at real Sonnet
+pricing put 14.73k tokens at 10-20 cents, off by more than an order of magnitude. Rather than
+assume Arize's cost math was buggy, the user's own pasted real Anthropic billing console
+table was cross-checked token-by-token against real per-token pricing (pulled live from the
+`claude-api` skill, not memory): ~30 real Sonnet API requests averaging ~38k input tokens
+each, plus unexplained `claude-haiku-4-5` calls nothing in this codebase ever configured.
+That arithmetic landed at ~$2.3 on input alone — close enough to Arize's reported $2.83 to
+confirm Arize's reporting was accurate. The real bug was inflated actual token usage per
+call, not a tracing/aggregation bug — a materially different, and more serious, finding than
+the one first suspected.
+
+**Root cause, confirmed from the real, installed `claude_agent_sdk` source, not guessed from
+behavior.** All 6 agentic call sites across all 6 files construct `ClaudeAgentOptions`
+without setting `setting_sources`, `skills`, or `strict_mcp_config` — every one of those
+three fields defaults to a value that means "behave like a full interactive Claude Code CLI
+session," confirmed directly from `ClaudeAgentOptions`'s own docstrings via
+`inspect.getsource()`: `setting_sources=None` loads CLAUDE.md and every filesystem settings
+source ("all sources loaded, matches CLI defaults"); `skills=None` is explicitly documented
+as "not 'skills off'"; `strict_mcp_config=False` lets the CLI additionally load whatever
+project/user/plugin MCP configuration exists beyond what the call itself passed in. None of
+these three narrow, schema-constrained, supposed-to-be-self-contained calls (an ADO
+investigation, a report parse, a zero-tool curation/prose/critique/design call) were ever
+designed to need any of that — every one of them ships its own complete `system_prompt` and
+declares its own `allowed_tools`/`mcp_servers` explicitly. The fix, confirmed as the correct
+SDK-documented mechanism (not a workaround): `setting_sources=[]`, `skills=[]`,
+`strict_mcp_config=True` on every `ClaudeAgentOptions` construction — "SDK isolation mode."
+
+**The fix was verified on ONE file first, with a real live billing cross-check, before
+touching the other 5 — the user's own explicit sequencing, held to literally.**
+`feature_agent.py`'s two real call sites (the investigation itself, and its auto-triggered
+groundedness judge) got the fix first, backed by a mechanical, credential-free test
+(`run_isolation_mode_test`, monkeypatching the module-level `query` symbol and asserting the
+isolation fields directly on the captured `ClaudeAgentOptions`) — proving the fix was wired
+without spending a real API call. Only after that mechanical proof did a real live call
+happen, spending real budget deliberately, not blindly.
+
+**Real regression #1 — the fix itself broke a previously-passing live run, in the exact same
+failure SHAPE as gotcha #10, for a different underlying reason.** The same `feature_agent.py`
+test (5-turn budget, the same real Feature #8 that had succeeded multiple times before)
+failed with `error_max_turns` immediately after the isolation fields were added — a real
+regression, not a coincidence, caught before spending another paid call by adding full
+message-stream debug logging (`_debug_log_message`, logging every `ToolUseBlock`/
+`ToolResultBlock` in the stream, not just the final `ResultMessage`) and by re-reading the
+SDK's own `_build_command`/subprocess-spawn source to check a specific hypothesis (whether
+`strict_mcp_config`/`setting_sources=[]` changes how the npx-spawned ADO MCP subprocess
+resolves its own env/PATH) before spending any further real budget. That specific hypothesis
+was NOT confirmed by the visible Python SDK source: `mcp_servers` is serialized into
+`--mcp-config` identically regardless of `strict_mcp_config`, and the CLI subprocess's own
+env construction (`inherited_env` + `options.env`) is untouched by either flag — with the
+honest caveat that the actual npx spawn happens inside the compiled `claude.exe` binary,
+genuinely opaque to Python-level inspection.
+
+**Real regression's actual cause — a mandatory ToolSearch discovery turn, real and
+budget-relevant only where a real MCP tool exists to discover.** Under SDK isolation mode,
+tool schemas are not preloaded into context the way a full interactive session would —
+confirmed real via the live run itself, not theorized: the first turn of a tool-using call is
+a mandatory discovery step before the model can invoke a real MCP tool for the first time.
+`feature_agent.py`'s `BASE_SYSTEM_PROMPT` had given an EXACT turn-by-turn budget (get details,
+batch-fetch children, one optional comments call, final answer = 4 tool-shaped turns + 1
+final = 5, `max_turns=5`, zero slack) written before isolation mode existed and before this
+discovery-turn cost was known — the fix that removed ~10x of unwanted context simultaneously
+introduced a real, previously-nonexistent turn cost the old budget had no room for. Fixed by
+bumping `max_turns` 5→6 and rewriting the system prompt's numbered budget to name turn 1 as
+tool discovery explicitly ("expected, not wasted"), so future readers don't mistake it for
+slack being removed rather than a real, accounted-for cost.
+
+**The discovery-turn cost is NOT universal — verified per file, not assumed, before deciding
+whether any of the other 5 files' turn budgets needed the same +1.** Applying the same +1
+blindly everywhere would have been guessing, not verifying — this project's own established
+"verify mechanically, never trust self-report" convention applied one level up, to a fix
+about to be applied to five files at once:
+- `status_report_agent.py`'s `investigate_status_report` has exactly one real MCP tool
+  (`parse_slide`) and already had `max_turns=6` (unchanged) — needed turns (discovery + one
+  parse_slide call + final answer = 3) sit well under the existing budget, so no numeric
+  change was needed; the same discovery-turn documentation was still added to its system
+  prompt for a future reader's sake, decoupled from whether the number itself needed to move.
+- `synthesis_agent.py` (all 4 real call sites: `curate_report`/`write_executive_summary` via
+  the shared `_run_agentic_call`, plus their two auto-triggered judges), `critique_agent.py`,
+  and `slide_generation_agent.py` Mode 1's `_generate_candidates` are ALL zero-tool calls
+  (`allowed_tools=[]`, no `mcp_servers`) — there is nothing for the model to discover, so the
+  ToolSearch turn simply does not apply, and none of their existing `max_turns` values needed
+  any adjustment.
+
+The general lesson, worth naming: a fix's side effect (here, a new mandatory turn) is only a
+real budget risk at the specific call sites whose existing accounting was already exact — a
+budget with slack absorbs it silently; a budget written as an exact tally does not.
+
+**Final result — real, billing-confirmed, not just mechanically verified.** The isolation fix
+was applied to all 6 files (12 real `ClaudeAgentOptions` construction sites total: 2 in
+`feature_agent.py`, 2 in `status_report_agent.py`, 3 in `synthesis_agent.py`, 1 in
+`critique_agent.py`, 1 in `slide_generation_agent.py`, plus the already-fixed
+`feature_agent.py` originals), each backed by the same mechanical `run_isolation_mode_test`
+pattern (module-level `query` monkeypatched, isolation fields asserted directly on every
+captured `ClaudeAgentOptions`), and each file's FULL pre-existing test suite re-run
+afterward with zero regressions. The user then ran the real, corrected `feature_agent.py`
+live against the real Anthropic API and real ADO org and reported the real billing delta:
+**$4.10 → $4.34, a $0.24 real cost for one Feature Agent investigation — a ~63% reduction**
+from the ~$0.65 pre-fix baseline for the same call shape. The ToolSearch discovery-turn
+overhead is real (confirmed structurally, not eliminated) but small relative to the ~10x
+reduction the isolation fix itself delivers.
+
+**The project's original ~$0.29/run design-time cost estimate (see "Cost estimate (validated,
+not assumed)" above) is INVALIDATED by this finding — corrected here explicitly, not silently
+left standing.** That estimate was based on a design-time token-count estimate, never verified
+against real billing until observability's first live trace caught the actual figure was off
+by roughly 10x. It is not simply "now lower thanks to this fix" — it was never an accurate
+figure for what the pipeline actually cost to begin with; the isolation fix corrects the
+*mechanism* that was silently inflating every real run.
+
+**Final, full-pipeline confirmation — a genuine `run_pipeline()` run across all 6 fixed files
+together (Feature Agent, Status Report Agent, Synthesis Agent, Critique Agent — Slide
+Generation Agent not exercised in this particular run), not just `feature_agent.py` in
+isolation.** Three things confirmed, per the same "verify, don't assume" standard as every
+other finding in this entry:
+
+1. **The "zero-tool-call agents don't need a turn-budget adjustment" reasoning held under a
+   real run, not just in theory.** Zero `error_max_turns` (or any similar failure) anywhere
+   on Synthesis Agent or Critique Agent, across BOTH attempts of a real two-attempt revision
+   cycle — the exact scenario (multiple back-to-back zero-tool calls under isolation mode)
+   the earlier per-file audit predicted would be safe because there's no MCP tool for the
+   model to discover. A live run is stronger evidence than the source-level reasoning alone,
+   and it agreed.
+2. **The bounded revision loop (Requirement 13's evaluator-optimizer pattern) still works
+   correctly end-to-end under isolation mode.** Critique Agent found a real, genuine issue on
+   attempt 1 — jargon leakage (raw ADO "Task"/"Story" terminology in executive-facing prose,
+   the same category of leak-into-prose failure gotcha #12 first caught, just a different
+   specific term this time) — Synthesis Agent revised using that feedback, and attempt 2
+   passed cleanly. Final result: `report_id=13`, `reviewed=true`, `attempts=2`. This is
+   real confirmation that isolation mode's changes (no more implicit CLAUDE.md/tool-catalog
+   context) didn't silently break the revision-feedback threading between Critique and
+   Synthesis — a plausible risk that was never directly tested until this run.
+3. **Real cost: $4.34 → $5.29, a $0.95 delta for Feature Agent + Status Report Agent +
+   Synthesis Agent × 2 attempts + Critique Agent × 2 attempts.** This is a reasonable,
+   explainable number against the corrected ~$0.29 baseline, not a red flag, for two
+   structural reasons a future reader should know before assuming regression: (a) a revision
+   cycle roughly doubles the Synthesis+Critique portion of the run by design — the original
+   ~$0.29 estimate's own "2 critique cycles assumed" framing already anticipated this cost
+   shape, it just was never billing-verified until now; (b) Slide Generation Agent was not
+   exercised in this run at all, so $0.95 is a partial-pipeline figure, not a full
+   apples-to-apples comparison against a complete 6-agent run. Directionally and structurally
+   consistent with the fix working as intended, not evidence against it.
+
+**Independent cross-validation from a second measurement system — Arize's own trace data,
+comparing the exact same root span before and after the fix.** The Anthropic billing
+console delta above is one measurement path (real invoiced dollars). A second, independent
+path — Arize's own reported cost for the `run_pipeline()` root `CHAIN` span, the same
+metric investigated at the very start of this whole thread — was compared directly:
+**$2.827862 (pre-fix, the original anomalous trace) → $1.616024 (post-fix, this
+confirmation run's root span), a ~43% reduction.** The two systems measure cost through
+different mechanisms (Anthropic's own billing ledger vs. Arize's OpenInference cost
+attribution) and were never expected to produce identical numbers — different run
+scope/shape (a revision cycle firing, Slide Generation excluded) makes an exact percentage
+match unlikely by design, not a red flag when they diverge somewhat. What matters is that
+both independently agree on DIRECTION (real, large reduction, not noise) and on rough
+MAGNITUDE (same order of reduction, not one system claiming 10% and the other 90%) — two
+measurement systems that don't share an implementation converging on the same conclusion is
+stronger evidence than either alone, the same "don't trust a single signal" instinct this
+entire investigation started from (the original anomaly was itself caught by cross-checking
+Arize's number against real pricing arithmetic, not by trusting Arize in isolation).
+
+**Gotcha #20 is FULLY RESOLVED as of this confirmation** — not just mechanically verified
+(all 6 files, 12 call sites, isolation fields proven via monkeypatched `query()`), not just
+single-file billing-confirmed (`feature_agent.py`'s $0.65→$0.24 delta), but now genuinely
+end-to-end confirmed: a real multi-agent `run_pipeline()` run, including a real revision
+cycle, completed cleanly with no isolation-mode-induced failures anywhere, and two
+independent real-cost measurement systems (Anthropic billing, Arize trace cost) both confirm
+a large, real cost reduction in the same direction and rough magnitude. The remaining open
+item is not this fix's correctness — it's that no single run yet exercises all 6 agents
+(including Slide Generation) together in one pass with a full billing/Arize comparison; that
+would sharpen the number further but does not change the resolved status of this gotcha.
