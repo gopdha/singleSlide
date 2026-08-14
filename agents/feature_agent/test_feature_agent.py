@@ -13,6 +13,7 @@ import asyncio
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent))
 from feature_agent import FEATURE_SCHEMA, _build_entry_wiql, investigate_feature, list_committed_features  # noqa: E402
@@ -22,6 +23,67 @@ from skill_loader import load_skill  # noqa: E402
 
 SKILLS_ROOT = str(Path(__file__).parent.parent.parent / "skills")
 TEST_PROJECT_ID = "ai-reports-demo"
+
+
+async def run_isolation_mode_test():
+    """Mechanically proves the SDK-isolation fix (CLAUDE.md 'Known gotchas' CRITICAL
+    entry) is actually wired on every ClaudeAgentOptions this file constructs — no
+    credentials needed, query() is mocked so nothing hits the network. Without this,
+    setting_sources defaults to None ('all sources loaded'), silently pulling this
+    project's own CLAUDE.md, the full built-in Claude Code tool catalog, and every
+    discoverable skill into a call that was designed to be a narrow, self-contained,
+    schema-constrained request — a real live trace showed this inflating a single
+    Feature investigation from ~2-8k expected input tokens to 36-49k."""
+    print("\nSDK isolation mode — mechanical proof (no credentials, query() is mocked):")
+
+    import feature_agent as fa
+    from claude_agent_sdk.types import ResultMessage
+
+    captured_options: list[Any] = []
+
+    async def _fake_query(*, prompt, options):
+        # investigate_feature makes exactly TWO real query() calls per invocation —
+        # the investigation itself, then the groundedness judge auto-triggered via
+        # safe_eval_call before returning. Both route through this same mocked query,
+        # so this single fake covers both real call sites in one pass. Distinguish by
+        # call order (Feature-shaped first, judge-shaped second) rather than by
+        # inspecting the prompt, since the point of this test is the OPTIONS, not the
+        # prompt content.
+        captured_options.append(options)
+        if len(captured_options) == 1:
+            structured_output = {
+                "feature_id": 1, "title": "t", "short_description": "s",
+                "status_label": "On Track", "progress_summary": "p", "risk": None, "evidence": [],
+            }
+        else:
+            structured_output = {"score": 0.9, "explanation": "fine"}
+        yield ResultMessage(
+            subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+            num_turns=1, session_id="fake", structured_output=structured_output,
+        )
+
+    original_query = fa.query
+    fa.query = _fake_query
+    try:
+        result = await fa.investigate_feature(
+            feature_id=1, title="t", org="o", project="p", pat_base64="cGxhY2Vob2xkZXI=",
+            project_id=TEST_PROJECT_ID, skills_root=SKILLS_ROOT,
+        )
+        assert result["status_label"] == "On Track"
+        assert len(captured_options) == 2, (
+            f"expected exactly 2 real query() calls (investigation + auto-triggered "
+            f"groundedness judge), got {len(captured_options)}"
+        )
+        for i, opts in enumerate(captured_options):
+            assert opts.setting_sources == [], f"call {i}: expected setting_sources=[], got {opts.setting_sources}"
+            assert opts.skills == [], f"call {i}: expected skills=[], got {opts.skills}"
+            assert opts.strict_mcp_config is True, f"call {i}: expected strict_mcp_config=True, got {opts.strict_mcp_config}"
+        print("  PASS  BOTH real query() calls investigate_feature makes (the investigation "
+              "itself, and the auto-triggered groundedness judge) carry setting_sources=[], "
+              "skills=[], strict_mcp_config=True (SDK isolation mode) — no CLAUDE.md/skills/"
+              "other MCP config leaks into either")
+    finally:
+        fa.query = original_query
 
 
 async def main():
@@ -53,6 +115,8 @@ async def main():
         sys.exit(1)
     except FileNotFoundError:
         print("  PASS  missing skill fails loudly (no silent fallback to a default)")
+
+    await run_isolation_mode_test()
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
@@ -87,7 +151,7 @@ async def main():
 
     first = features[0]
     print(f"\nInvestigating #{first['id']} (\"{first['title']}\")...")
-    result = await investigate_feature(first["id"], first["title"], org, project, pat_base64, TEST_PROJECT_ID, SKILLS_ROOT)
+    result = await investigate_feature(first["id"], first["title"], org, project, pat_base64, TEST_PROJECT_ID, SKILLS_ROOT, debug=True)
     print("\nResult:")
     for k, v in result.items():
         print(f"  {k}: {v}")

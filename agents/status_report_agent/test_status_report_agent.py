@@ -15,6 +15,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent))
 from status_report_agent import (  # noqa: E402
@@ -58,6 +59,59 @@ def _build_fixture():
     prs.save(str(FIXTURE_PATH))
 
 
+async def run_isolation_mode_test():
+    """Mechanically proves the SDK-isolation fix (CLAUDE.md 'Known gotchas' CRITICAL entry)
+    is wired on every ClaudeAgentOptions this file constructs — no credentials needed,
+    query() is mocked so nothing hits the network. Same pattern as
+    feature_agent/test_feature_agent.py's own run_isolation_mode_test."""
+    print("\nSDK isolation mode — mechanical proof (no credentials, query() is mocked):")
+
+    import status_report_agent as sra
+    from claude_agent_sdk.types import ResultMessage, ToolResultBlock, UserMessage
+
+    captured_options: list[Any] = []
+
+    async def _fake_query(*, prompt, options):
+        # investigate_status_report makes exactly TWO real query() calls per invocation —
+        # the investigation itself (which also surfaces a ToolResultBlock so the
+        # extraction-faithfulness judge gets auto-triggered before returning), then the
+        # judge call itself. Both route through this same mocked query.
+        captured_options.append(options)
+        if len(captured_options) == 1:
+            yield UserMessage(content=[ToolResultBlock(tool_use_id="fake", content="fake parse_slide output", is_error=False)])
+            structured_output = {
+                "team_lead_id": "t", "other_initiatives": [], "potential_enrichments": [],
+                "color_signals": [], "parse_confidence": 0.9,
+            }
+        else:
+            structured_output = {"score": 0.9, "explanation": "fine"}
+        yield ResultMessage(
+            subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+            num_turns=1, session_id="fake", structured_output=structured_output,
+        )
+
+    original_query = sra.query
+    sra.query = _fake_query
+    try:
+        result = await sra.investigate_status_report(
+            file_path="fake.pptx", existing_features=[], project_id=TEST_PROJECT_ID, skills_root=SKILLS_ROOT,
+        )
+        assert result["team_lead_id"] == "t"
+        assert len(captured_options) == 2, (
+            f"expected exactly 2 real query() calls (investigation + auto-triggered "
+            f"extraction-faithfulness judge), got {len(captured_options)}"
+        )
+        for i, opts in enumerate(captured_options):
+            assert opts.setting_sources == [], f"call {i}: expected setting_sources=[], got {opts.setting_sources}"
+            assert opts.skills == [], f"call {i}: expected skills=[], got {opts.skills}"
+            assert opts.strict_mcp_config is True, f"call {i}: expected strict_mcp_config=True, got {opts.strict_mcp_config}"
+        print("  PASS  BOTH real query() calls investigate_status_report makes (the investigation "
+              "itself, and the auto-triggered extraction-faithfulness judge) carry setting_sources=[], "
+              "skills=[], strict_mcp_config=True (SDK isolation mode)")
+    finally:
+        sra.query = original_query
+
+
 async def main():
     print("Status Report Agent (skill-driven) — test suite\n")
 
@@ -94,6 +148,8 @@ async def main():
     reports = list_submitted_reports(str(Path(__file__).parent), TEST_PROJECT_ID, SKILLS_ROOT)
     assert isinstance(reports, list)
     print(f"  PASS  list_submitted_reports() runs against a real directory (found {len(reports)} existing .pptx here)")
+
+    await run_isolation_mode_test()
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:

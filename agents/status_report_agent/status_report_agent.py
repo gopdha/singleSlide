@@ -28,9 +28,10 @@ from pathlib import Path
 from typing import Any, Optional
 
 from claude_agent_sdk import ClaudeAgentOptions, query
-from claude_agent_sdk.types import ResultMessage
+from claude_agent_sdk.types import ResultMessage, ToolResultBlock, UserMessage
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "common"))
+import observability as obs  # noqa: E402
 from skill_loader import load_skill  # noqa: E402
 
 PPT_MCP_SERVER_PATH = Path(__file__).parent.parent.parent / "mcp_servers" / "ppt_mcp" / "server.py"
@@ -92,12 +93,15 @@ STATUS_REPORT_SCHEMA = {
 BASE_SYSTEM_PROMPT = """You are the Status Report Agent, reading one team lead's weekly status report
 (a PowerPoint slide) for an executive weekly report.
 
-YOUR TOOL-CALL BUDGET IS LIMITED. Your final structured answer itself uses one turn, so
-budget accordingly:
-1. Call parse_slide exactly once, on the file path given to you.
-2. Reason over its sections, tables, and color_cues yourself — no further tool calls are
+YOUR TOOL-CALL BUDGET IS LIMITED. Under this project's SDK isolation-mode configuration
+(strict_mcp_config — see CLAUDE.md "Known gotchas"), your first turn is a mandatory
+tool-discovery step before you can call parse_slide for the first time — expected, not
+wasted. Your final structured answer itself also uses one turn, so budget accordingly:
+1. Turn 1 is tool discovery.
+2. Call parse_slide exactly once, on the file path given to you.
+3. Reason over its sections, tables, and color_cues yourself — no further tool calls are
    available or needed.
-3. Then produce your final answer.
+4. Then produce your final answer.
 
 EXISTING FEATURES (from ADO — match report content against this list; it is titles only,
 no description, so matching is inherently approximate):
@@ -170,6 +174,67 @@ def _format_existing_features(existing_features: list[dict[str, Any]]) -> str:
     return "\n".join(f"- #{f['id']}: {f['title']}" for f in existing_features)
 
 
+EXTRACTION_FAITHFULNESS_JUDGE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "score": {"type": "number", "description": "0.0 (invents content not in the source) to 1.0 (every extracted item is grounded in the source)."},
+        "explanation": {"type": "string"},
+    },
+    "required": ["score", "explanation"],
+    "additionalProperties": False,
+}
+
+EXTRACTION_FAITHFULNESS_JUDGE_SYSTEM_PROMPT = """You are a quality judge comparing a Status
+Report Agent's structured extraction against the raw parse_slide output it was extracted from.
+You have no tools — everything you need is in the prompt below.
+
+Score 0.0 (the extraction invents an initiative, an enrichment excerpt, or a detail not actually
+present in the raw source) to 1.0 (every other_initiatives/potential_enrichments entry is
+genuinely grounded in the raw source text — condensed or paraphrased is fine, invented is not).
+An empty extraction from a source with no relevant content is faithful, not a failure.
+
+Return your answer as JSON matching the provided schema exactly."""
+
+
+async def _judge_extraction_faithfulness(raw_source: Any, extraction: dict[str, Any], model: str) -> dict[str, Any]:
+    """Only ever invoked through common.observability.safe_eval_call — free to raise on any
+    real failure; the caller turns that into 'no score this run', never a pipeline failure.
+
+    raw_source is whatever parse_slide's ToolResultBlock.content actually was for this run
+    (captured off the message stream in investigate_status_report — see its own docstring
+    for why this is the one place internal tool-call content is read directly rather than
+    re-fetched deterministically)."""
+    options = ClaudeAgentOptions(
+        system_prompt=EXTRACTION_FAITHFULNESS_JUDGE_SYSTEM_PROMPT,
+        model=model,
+        allowed_tools=[],
+        permission_mode="dontAsk",
+        max_turns=2,
+        output_format={"type": "json_schema", "schema": EXTRACTION_FAITHFULNESS_JUDGE_SCHEMA},
+        # SDK isolation mode — see CLAUDE.md "Known gotchas" CRITICAL entry.
+        setting_sources=[],
+        skills=[],
+        strict_mcp_config=True,
+    )
+    prompt = f"""RAW parse_slide OUTPUT (the source):
+{_json.dumps(raw_source, default=str)}
+
+STRUCTURED EXTRACTION (to be judged against the source above):
+{_json.dumps(extraction, indent=2)}"""
+
+    final_result: Optional[Any] = None
+    async with aclosing(query(prompt=prompt, options=options)) as messages:
+        async for message in messages:
+            if isinstance(message, ResultMessage):
+                if message.is_error:
+                    raise RuntimeError(message.result or f"extraction faithfulness judge run did not succeed: {message.subtype}")
+                final_result = message.structured_output if message.structured_output is not None else message.result
+
+    if final_result is None:
+        raise RuntimeError("extraction faithfulness judge produced no result")
+    return _json.loads(final_result) if isinstance(final_result, str) else final_result
+
+
 async def investigate_status_report(
     file_path: str,
     existing_features: list[dict[str, Any]],
@@ -201,28 +266,71 @@ async def investigate_status_report(
         permission_mode="dontAsk",
         max_turns=max_turns,
         output_format={"type": "json_schema", "schema": STATUS_REPORT_SCHEMA},
+        # SDK isolation mode — see CLAUDE.md "Known gotchas" CRITICAL entry.
+        setting_sources=[],
+        skills=[],
+        strict_mcp_config=True,
     )
 
     final_result: Optional[Any] = None
-    try:
-        async with aclosing(query(prompt=prompt, options=options)) as messages:
-            async for message in messages:
-                if isinstance(message, ResultMessage):
-                    if message.is_error:
-                        raise RuntimeError(message.result or f"Status Report Agent run did not succeed: {message.subtype}")
-                    final_result = message.structured_output if message.structured_output is not None else message.result
-    except Exception as err:  # noqa: BLE001
-        if "invalid api key" in str(err).lower() or "invalid x-api-key" in str(err).lower():
-            raise RuntimeError(
-                "Status Report Agent failed: invalid ANTHROPIC_API_KEY. "
-                "Set a real key from https://console.anthropic.com/settings/keys and try again."
-            ) from err
-        raise RuntimeError(f"Status Report Agent failed on report '{file_path}': {err}") from err
+    result_message: Optional[ResultMessage] = None
+    # Captured off the message stream, not re-fetched with a second deterministic
+    # parse_slide call: the SDK's own tool-use loop already surfaces this via
+    # UserMessage.content's ToolResultBlock entries (confirmed via claude_agent_sdk.types),
+    # and reading it here doesn't require adding TOOL-kind span instrumentation to Status
+    # Report Agent's internal loop (deliberately out of v1 scope, same as Feature Agent's
+    # own internal ADO calls — see the observability design checkpoint). This is judge
+    # input plumbing, not tracing.
+    parse_slide_raw: Optional[Any] = None
+    with obs.traced_span(
+        "status_report_agent.investigate_status_report", "LLM", obs.input_value_attribute(prompt),
+    ) as span:
+        try:
+            async with aclosing(query(prompt=prompt, options=options)) as messages:
+                async for message in messages:
+                    if isinstance(message, UserMessage) and isinstance(message.content, list) and parse_slide_raw is None:
+                        for block in message.content:
+                            if isinstance(block, ToolResultBlock):
+                                parse_slide_raw = block.content
+                                break
+                    if isinstance(message, ResultMessage):
+                        result_message = message
+                        if message.is_error:
+                            raise RuntimeError(message.result or f"Status Report Agent run did not succeed: {message.subtype}")
+                        final_result = message.structured_output if message.structured_output is not None else message.result
+        except Exception as err:  # noqa: BLE001
+            span.record_exception(err)
+            if "invalid api key" in str(err).lower() or "invalid x-api-key" in str(err).lower():
+                raise RuntimeError(
+                    "Status Report Agent failed: invalid ANTHROPIC_API_KEY. "
+                    "Set a real key from https://console.anthropic.com/settings/keys and try again."
+                ) from err
+            raise RuntimeError(f"Status Report Agent failed on report '{file_path}': {err}") from err
 
-    if final_result is None:
-        raise RuntimeError(f"Status Report Agent produced no result for report '{file_path}'.")
+        if final_result is None:
+            raise RuntimeError(f"Status Report Agent produced no result for report '{file_path}'.")
 
-    return _json.loads(final_result) if isinstance(final_result, str) else final_result
+        parsed = _json.loads(final_result) if isinstance(final_result, str) else final_result
+        span.set_attributes(obs.llm_span_attributes(
+            model_name=model,
+            usage=result_message.usage if result_message else None,
+            invocation_parameters={"max_turns": max_turns, "permission_mode": "dontAsk", "allowed_tools": options.allowed_tools},
+            input_value=prompt,
+            output_value=_json.dumps(parsed),
+            total_cost_usd=result_message.total_cost_usd if result_message else None,
+        ))
+
+        if parse_slide_raw is not None:
+            judge_result = await obs.safe_eval_call(
+                lambda: _judge_extraction_faithfulness(parse_slide_raw, parsed, model),
+                judge_name="status_report_extraction_faithfulness",
+            )
+            if judge_result is not None:
+                span.set_attributes(obs.evaluation_attributes([
+                    {"name": "extraction_faithfulness", "score": judge_result.get("score"), "explanation": judge_result.get("explanation")},
+                ]))
+
+        return parsed
 
 
 async def investigate_all_status_reports(

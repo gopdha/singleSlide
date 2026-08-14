@@ -25,12 +25,13 @@ import sys
 from contextlib import aclosing
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from claude_agent_sdk import ClaudeAgentOptions, query
 from claude_agent_sdk.types import ResultMessage
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "common"))
+import observability as obs  # noqa: E402
 from mcp_client import open_mcp_client  # noqa: E402
 from risk_floor import RISK_FLOOR_LABELS, check_risk_floor  # noqa: E402
 from skill_loader import load_skill  # noqa: E402
@@ -251,6 +252,76 @@ PROJECT-SPECIFIC NOTES (curation priorities/tone for this project):
 Return your answer as JSON matching the provided schema exactly."""
 
 
+COMPRESSION_FAITHFULNESS_JUDGE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "score": {"type": "number", "description": "0.0 (a curated display_text introduces a claim/number/detail not in its original) to 1.0 (every entry is a faithful compression)."},
+        "explanation": {"type": "string"},
+    },
+    "required": ["score", "explanation"],
+    "additionalProperties": False,
+}
+
+COMPRESSION_FAITHFULNESS_JUDGE_SYSTEM_PROMPT = """You are a quality judge scoring whether a
+curated Feature Status slide's display_text is a faithful compression of each Feature's
+original progress_summary — condensed is fine, invented is not. You have no tools —
+everything you need is in the prompt below.
+
+Score 0.0 (one or more curated_features entries introduce a claim, number, or detail not
+present in that Feature's original progress_summary) to 1.0 (every entry is a faithful,
+non-distorting compression of its original). Judge the WORST offender if entries vary in
+quality — a single fabricated claim should pull the score down meaningfully, not average out
+against several faithful ones.
+
+Return your answer as JSON matching the provided schema exactly."""
+
+
+async def _judge_compression_faithfulness(
+    original_features: list[dict[str, Any]], curation_result: dict[str, Any], model: str,
+) -> list[dict[str, Any]]:
+    """Only ever invoked through common.observability.safe_eval_call — free to raise; the
+    caller turns that into 'no score this run', never a pipeline failure. Returns a
+    single-entry evaluations list (see _run_agentic_call's judge contract)."""
+    originals_by_id = {f["feature_id"]: f for f in original_features}
+    pairs = [
+        {
+            "feature_id": cf["feature_id"],
+            "title": cf["title"],
+            "original_progress_summary": originals_by_id.get(cf["feature_id"], {}).get(
+                "progress_summary", "(no matching original — this entry has no corresponding input Feature)",
+            ),
+            "curated_display_text": cf["display_text"],
+        }
+        for cf in curation_result["curated_features"]
+    ]
+    options = ClaudeAgentOptions(
+        system_prompt=COMPRESSION_FAITHFULNESS_JUDGE_SYSTEM_PROMPT,
+        model=model,
+        allowed_tools=[],
+        permission_mode="dontAsk",
+        max_turns=2,
+        output_format={"type": "json_schema", "schema": COMPRESSION_FAITHFULNESS_JUDGE_SCHEMA},
+        # SDK isolation mode — see CLAUDE.md "Known gotchas" CRITICAL entry.
+        setting_sources=[],
+        skills=[],
+        strict_mcp_config=True,
+    )
+    prompt = f"ORIGINAL-VS-CURATED PAIRS:\n{_json.dumps(pairs, indent=2)}"
+
+    final_result: Optional[Any] = None
+    async with aclosing(query(prompt=prompt, options=options)) as messages:
+        async for message in messages:
+            if isinstance(message, ResultMessage):
+                if message.is_error:
+                    raise RuntimeError(message.result or f"compression faithfulness judge run did not succeed: {message.subtype}")
+                final_result = message.structured_output if message.structured_output is not None else message.result
+
+    if final_result is None:
+        raise RuntimeError("compression faithfulness judge produced no result")
+    parsed = _json.loads(final_result) if isinstance(final_result, str) else final_result
+    return [{"name": "compression_faithfulness", "score": parsed.get("score"), "explanation": parsed.get("explanation")}]
+
+
 async def curate_report(
     features: list[dict[str, Any]],
     initiatives: list[dict[str, Any]],
@@ -288,7 +359,9 @@ PRIOR WEEK (null if this is the first report for this project):
 
     result = await _run_agentic_call(
         prompt=prompt, system_prompt=system_prompt, schema=CURATE_REPORT_SCHEMA,
-        model=model, max_turns=max_turns, caller_name="curate_report",
+        model=model, max_turns=max_turns, caller_name="synthesis_agent.curate_report",
+        judge=lambda parsed: _judge_compression_faithfulness(features, parsed, model),
+        judge_name="compression_faithfulness",
     )
 
     missing = check_risk_floor(features, result["curated_features"])
@@ -352,6 +425,86 @@ PROJECT-SPECIFIC NOTES (tone/style for this project):
 Return your answer as JSON matching the provided schema exactly."""
 
 
+SUMMARY_QUALITY_JUDGE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "groundedness_score": {"type": "number", "description": "0.0 (invents a claim/number/name not in curated_features/curated_initiatives/rag_rollup_result) to 1.0 (every claim is grounded)."},
+        "coherence_score": {"type": "number", "description": "0.0 (disjointed, unclear, doesn't read as one connected executive summary) to 1.0 (clear, well-organized, leads with the headline)."},
+        "explanation": {"type": "string"},
+    },
+    "required": ["groundedness_score", "coherence_score", "explanation"],
+    "additionalProperties": False,
+}
+
+SUMMARY_QUALITY_JUDGE_SYSTEM_PROMPT = """You are a quality judge scoring an Executive Summary
+slide's prose on two DISTINCT dimensions. You have no tools — everything you need is in the
+prompt below.
+
+groundedness_score: 0.0 (executive_summary states a claim, number, or name not present in the
+curated_features/curated_initiatives/rag_rollup_result it was written from) to 1.0 (every claim
+is genuinely grounded in that data — paraphrased is fine, invented is not).
+
+coherence_score: 0.0 (disjointed, buries the headline, hard to follow) to 1.0 (leads with the
+headline — overall status and the biggest risk if any — and reads as one clear, well-organized
+executive summary). This is independent of groundedness: prose can be perfectly grounded and
+still poorly organized, or vice versa — score each on its own merits.
+
+Return your answer as JSON matching the provided schema exactly."""
+
+
+async def _judge_summary_quality(
+    curated_features: list[dict[str, Any]], curated_initiatives: list[dict[str, Any]],
+    rag_rollup_result: dict[str, Any], narrative_result: dict[str, Any], model: str,
+) -> list[dict[str, Any]]:
+    """Only ever invoked through common.observability.safe_eval_call — free to raise; the
+    caller turns that into 'no score this run', never a pipeline failure. Returns a
+    TWO-entry evaluations list (groundedness + coherence) — the only judge in this system
+    that scores more than one dimension from a single call, per the design checkpoint's
+    explicit per-component quality-scoring mapping."""
+    options = ClaudeAgentOptions(
+        system_prompt=SUMMARY_QUALITY_JUDGE_SYSTEM_PROMPT,
+        model=model,
+        allowed_tools=[],
+        permission_mode="dontAsk",
+        max_turns=2,
+        output_format={"type": "json_schema", "schema": SUMMARY_QUALITY_JUDGE_SCHEMA},
+        # SDK isolation mode — see CLAUDE.md "Known gotchas" CRITICAL entry.
+        setting_sources=[],
+        skills=[],
+        strict_mcp_config=True,
+    )
+    prompt = f"""EXECUTIVE_SUMMARY:
+{narrative_result["executive_summary"]}
+
+TREND_LINE:
+{narrative_result["trend_line"]!r}
+
+CURATED FEATURES (source data):
+{_json.dumps(curated_features, indent=2)}
+
+CURATED INITIATIVES (source data):
+{_json.dumps(curated_initiatives, indent=2)}
+
+RAG ROLLUP RESULT (source data):
+{_json.dumps(rag_rollup_result, indent=2)}"""
+
+    final_result: Optional[Any] = None
+    async with aclosing(query(prompt=prompt, options=options)) as messages:
+        async for message in messages:
+            if isinstance(message, ResultMessage):
+                if message.is_error:
+                    raise RuntimeError(message.result or f"summary quality judge run did not succeed: {message.subtype}")
+                final_result = message.structured_output if message.structured_output is not None else message.result
+
+    if final_result is None:
+        raise RuntimeError("summary quality judge produced no result")
+    parsed = _json.loads(final_result) if isinstance(final_result, str) else final_result
+    return [
+        {"name": "groundedness", "score": parsed.get("groundedness_score"), "explanation": parsed.get("explanation")},
+        {"name": "coherence", "score": parsed.get("coherence_score"), "explanation": parsed.get("explanation")},
+    ]
+
+
 async def write_executive_summary(
     curated_features: list[dict[str, Any]],
     curated_initiatives: list[dict[str, Any]],
@@ -388,7 +541,9 @@ PRIOR WEEK (null if this is the first report for this project):
 
     return await _run_agentic_call(
         prompt=prompt, system_prompt=system_prompt, schema=WRITE_SUMMARY_SCHEMA,
-        model=model, max_turns=max_turns, caller_name="write_executive_summary",
+        model=model, max_turns=max_turns, caller_name="synthesis_agent.write_executive_summary",
+        judge=lambda parsed: _judge_summary_quality(curated_features, curated_initiatives, rag_rollup_result, parsed, model),
+        judge_name="summary_quality",
     )
 
 
@@ -398,7 +553,20 @@ PRIOR WEEK (null if this is the first report for this project):
 
 async def _run_agentic_call(
     prompt: str, system_prompt: str, schema: dict[str, Any], model: str, max_turns: int, caller_name: str,
+    judge: Optional[Callable[[dict[str, Any]], Awaitable[list[dict[str, Any]]]]] = None,
+    judge_name: Optional[str] = None,
 ) -> dict[str, Any]:
+    """judge, if given, is called with this call's own parsed result AFTER the LLM span's
+    llm.* attributes are already set, but BEFORE the span closes — so its score(s) attach
+    to the SAME span via common.observability.evaluation_attributes, per the verified
+    Annotations/Evaluations mechanism (must be the same span, not a separate one). judge
+    must return a LIST of {"name","score","explanation"} dicts, not a single dict — Part C's
+    judge returns TWO entries (groundedness + coherence) from one call, Part B's returns
+    one; a single-dict contract would have forced a second, awkward shape just for Part C.
+    Always invoked through safe_eval_call: a judge failure never affects this function's
+    real return value. critique_agent's and slide_generation_agent's own _run_agentic_call
+    copies (duplicated, not cross-imported, per this project's established precedent for
+    this exact helper) don't take a judge param — v1 doesn't score either of those."""
     options = ClaudeAgentOptions(
         system_prompt=system_prompt,
         model=model,
@@ -406,28 +574,51 @@ async def _run_agentic_call(
         permission_mode="dontAsk",
         max_turns=max_turns,
         output_format={"type": "json_schema", "schema": schema},
+        # SDK isolation mode — see CLAUDE.md "Known gotchas" CRITICAL entry.
+        setting_sources=[],
+        skills=[],
+        strict_mcp_config=True,
     )
 
     final_result: Optional[Any] = None
-    try:
-        async with aclosing(query(prompt=prompt, options=options)) as messages:
-            async for message in messages:
-                if isinstance(message, ResultMessage):
-                    if message.is_error:
-                        raise RuntimeError(message.result or f"{caller_name} run did not succeed: {message.subtype}")
-                    final_result = message.structured_output if message.structured_output is not None else message.result
-    except Exception as err:  # noqa: BLE001
-        if "invalid api key" in str(err).lower() or "invalid x-api-key" in str(err).lower():
-            raise RuntimeError(
-                f"{caller_name} failed: invalid ANTHROPIC_API_KEY. "
-                "Set a real key from https://console.anthropic.com/settings/keys and try again."
-            ) from err
-        raise RuntimeError(f"{caller_name} failed: {err}") from err
+    result_message: Optional[ResultMessage] = None
+    with obs.traced_span(caller_name, "LLM", obs.input_value_attribute(prompt)) as span:
+        try:
+            async with aclosing(query(prompt=prompt, options=options)) as messages:
+                async for message in messages:
+                    if isinstance(message, ResultMessage):
+                        result_message = message
+                        if message.is_error:
+                            raise RuntimeError(message.result or f"{caller_name} run did not succeed: {message.subtype}")
+                        final_result = message.structured_output if message.structured_output is not None else message.result
+        except Exception as err:  # noqa: BLE001
+            span.record_exception(err)
+            if "invalid api key" in str(err).lower() or "invalid x-api-key" in str(err).lower():
+                raise RuntimeError(
+                    f"{caller_name} failed: invalid ANTHROPIC_API_KEY. "
+                    "Set a real key from https://console.anthropic.com/settings/keys and try again."
+                ) from err
+            raise RuntimeError(f"{caller_name} failed: {err}") from err
 
-    if final_result is None:
-        raise RuntimeError(f"{caller_name} produced no result.")
+        if final_result is None:
+            raise RuntimeError(f"{caller_name} produced no result.")
 
-    return _json.loads(final_result) if isinstance(final_result, str) else final_result
+        parsed = _json.loads(final_result) if isinstance(final_result, str) else final_result
+        span.set_attributes(obs.llm_span_attributes(
+            model_name=model,
+            usage=result_message.usage if result_message else None,
+            invocation_parameters={"max_turns": max_turns, "permission_mode": "dontAsk", "allowed_tools": []},
+            input_value=prompt,
+            output_value=_json.dumps(parsed),
+            total_cost_usd=result_message.total_cost_usd if result_message else None,
+        ))
+
+        if judge is not None:
+            evaluations = await obs.safe_eval_call(lambda: judge(parsed), judge_name=judge_name or caller_name)
+            if evaluations is not None:
+                span.set_attributes(obs.evaluation_attributes(evaluations))
+
+        return parsed
 
 
 # =============================================================================

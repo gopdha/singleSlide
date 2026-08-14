@@ -42,6 +42,7 @@ from claude_agent_sdk import ClaudeAgentOptions, query
 from claude_agent_sdk.types import ResultMessage
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "common"))
+import observability as obs  # noqa: E402
 from risk_floor import RISK_FLOOR_LABELS, check_risk_floor  # noqa: E402
 from skill_loader import load_skill  # noqa: E402
 
@@ -134,6 +135,9 @@ def _grounding_coverage_check(curated_features: list[dict[str, Any]], executive_
 async def _run_agentic_call(
     prompt: str, system_prompt: str, schema: dict[str, Any], model: str, max_turns: int, caller_name: str,
 ) -> dict[str, Any]:
+    """Traced, but never scored — critique_agent IS the evaluator; nothing in v1 judges the
+    judge (see the observability design checkpoint's per-component quality-scoring mapping).
+    No judge param, unlike synthesis_agent's own copy of this same duplicated helper."""
     options = ClaudeAgentOptions(
         system_prompt=system_prompt,
         model=model,
@@ -141,28 +145,45 @@ async def _run_agentic_call(
         permission_mode="dontAsk",
         max_turns=max_turns,
         output_format={"type": "json_schema", "schema": schema},
+        # SDK isolation mode — see CLAUDE.md "Known gotchas" CRITICAL entry.
+        setting_sources=[],
+        skills=[],
+        strict_mcp_config=True,
     )
 
     final_result: Optional[Any] = None
-    try:
-        async with aclosing(query(prompt=prompt, options=options)) as messages:
-            async for message in messages:
-                if isinstance(message, ResultMessage):
-                    if message.is_error:
-                        raise RuntimeError(message.result or f"{caller_name} run did not succeed: {message.subtype}")
-                    final_result = message.structured_output if message.structured_output is not None else message.result
-    except Exception as err:  # noqa: BLE001
-        if "invalid api key" in str(err).lower() or "invalid x-api-key" in str(err).lower():
-            raise RuntimeError(
-                f"{caller_name} failed: invalid ANTHROPIC_API_KEY. "
-                "Set a real key from https://console.anthropic.com/settings/keys and try again."
-            ) from err
-        raise RuntimeError(f"{caller_name} failed: {err}") from err
+    result_message: Optional[ResultMessage] = None
+    with obs.traced_span(caller_name, "LLM", obs.input_value_attribute(prompt)) as span:
+        try:
+            async with aclosing(query(prompt=prompt, options=options)) as messages:
+                async for message in messages:
+                    if isinstance(message, ResultMessage):
+                        result_message = message
+                        if message.is_error:
+                            raise RuntimeError(message.result or f"{caller_name} run did not succeed: {message.subtype}")
+                        final_result = message.structured_output if message.structured_output is not None else message.result
+        except Exception as err:  # noqa: BLE001
+            span.record_exception(err)
+            if "invalid api key" in str(err).lower() or "invalid x-api-key" in str(err).lower():
+                raise RuntimeError(
+                    f"{caller_name} failed: invalid ANTHROPIC_API_KEY. "
+                    "Set a real key from https://console.anthropic.com/settings/keys and try again."
+                ) from err
+            raise RuntimeError(f"{caller_name} failed: {err}") from err
 
-    if final_result is None:
-        raise RuntimeError(f"{caller_name} produced no result.")
+        if final_result is None:
+            raise RuntimeError(f"{caller_name} produced no result.")
 
-    return _json.loads(final_result) if isinstance(final_result, str) else final_result
+        parsed = _json.loads(final_result) if isinstance(final_result, str) else final_result
+        span.set_attributes(obs.llm_span_attributes(
+            model_name=model,
+            usage=result_message.usage if result_message else None,
+            invocation_parameters={"max_turns": max_turns, "permission_mode": "dontAsk", "allowed_tools": []},
+            input_value=prompt,
+            output_value=_json.dumps(parsed),
+            total_cost_usd=result_message.total_cost_usd if result_message else None,
+        ))
+        return parsed
 
 
 async def critique_report(
@@ -212,7 +233,7 @@ PRIOR WEEK (null if this is the first report for this project):
 
     skill_result = await _run_agentic_call(
         prompt=prompt, system_prompt=system_prompt, schema=CRITIQUE_SCHEMA,
-        model=model, max_turns=max_turns, caller_name="critique_report",
+        model=model, max_turns=max_turns, caller_name="critique_agent.critique_report",
     )
 
     all_checks = code_checks + skill_result["checks"]

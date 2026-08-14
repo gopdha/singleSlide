@@ -62,6 +62,7 @@ from pptx.enum.text import PP_ALIGN
 from pptx.util import Inches, Pt
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "common"))
+import observability as obs  # noqa: E402
 from skill_loader import load_skill, write_skill  # noqa: E402
 
 SKILL_NAME = "slide-generation-agent"
@@ -598,31 +599,50 @@ def default_ask_human(question: str, options: Optional[list[str]] = None) -> str
 async def _run_agentic_call(
     prompt: str, system_prompt: str, schema: dict[str, Any], model: str, max_turns: int, caller_name: str,
 ) -> dict[str, Any]:
+    """Traced, but never scored — Mode 1's flex_bounds are already code-validated
+    (_validate_flex_bounds) immediately after this returns; v1's quality-scoring mapping
+    doesn't add an LLM judge here (see the observability design checkpoint). No judge
+    param, unlike synthesis_agent's own copy of this same duplicated helper."""
     options = ClaudeAgentOptions(
         system_prompt=system_prompt, model=model, allowed_tools=[], permission_mode="dontAsk",
         max_turns=max_turns, output_format={"type": "json_schema", "schema": schema},
+        # SDK isolation mode — see CLAUDE.md "Known gotchas" CRITICAL entry.
+        setting_sources=[], skills=[], strict_mcp_config=True,
     )
 
     final_result: Optional[Any] = None
-    try:
-        async with aclosing(query(prompt=prompt, options=options)) as messages:
-            async for message in messages:
-                if isinstance(message, ResultMessage):
-                    if message.is_error:
-                        raise RuntimeError(message.result or f"{caller_name} run did not succeed: {message.subtype}")
-                    final_result = message.structured_output if message.structured_output is not None else message.result
-    except Exception as err:  # noqa: BLE001
-        if "invalid api key" in str(err).lower() or "invalid x-api-key" in str(err).lower():
-            raise RuntimeError(
-                f"{caller_name} failed: invalid ANTHROPIC_API_KEY. "
-                "Set a real key from https://console.anthropic.com/settings/keys and try again."
-            ) from err
-        raise RuntimeError(f"{caller_name} failed: {err}") from err
+    result_message: Optional[ResultMessage] = None
+    with obs.traced_span(caller_name, "LLM", obs.input_value_attribute(prompt)) as span:
+        try:
+            async with aclosing(query(prompt=prompt, options=options)) as messages:
+                async for message in messages:
+                    if isinstance(message, ResultMessage):
+                        result_message = message
+                        if message.is_error:
+                            raise RuntimeError(message.result or f"{caller_name} run did not succeed: {message.subtype}")
+                        final_result = message.structured_output if message.structured_output is not None else message.result
+        except Exception as err:  # noqa: BLE001
+            span.record_exception(err)
+            if "invalid api key" in str(err).lower() or "invalid x-api-key" in str(err).lower():
+                raise RuntimeError(
+                    f"{caller_name} failed: invalid ANTHROPIC_API_KEY. "
+                    "Set a real key from https://console.anthropic.com/settings/keys and try again."
+                ) from err
+            raise RuntimeError(f"{caller_name} failed: {err}") from err
 
-    if final_result is None:
-        raise RuntimeError(f"{caller_name} produced no result.")
+        if final_result is None:
+            raise RuntimeError(f"{caller_name} produced no result.")
 
-    return _json.loads(final_result) if isinstance(final_result, str) else final_result
+        parsed = _json.loads(final_result) if isinstance(final_result, str) else final_result
+        span.set_attributes(obs.llm_span_attributes(
+            model_name=model,
+            usage=result_message.usage if result_message else None,
+            invocation_parameters={"max_turns": max_turns, "permission_mode": "dontAsk", "allowed_tools": []},
+            input_value=prompt,
+            output_value=_json.dumps(parsed),
+            total_cost_usd=result_message.total_cost_usd if result_message else None,
+        ))
+        return parsed
 
 
 # =============================================================================
@@ -748,7 +768,7 @@ async def _generate_candidates(project_id: str, model: str, debug: bool = False)
     result = await _run_agentic_call(
         prompt=f"Design 3 slide-template candidates for project '{project_id}'.",
         system_prompt=DESIGN_SYSTEM_PROMPT, schema=CANDIDATE_SCHEMA, model=model, max_turns=3,
-        caller_name="_generate_candidates",
+        caller_name="slide_generation_agent._generate_candidates",
     )
     candidates = result["candidates"]
     for i, candidate in enumerate(candidates):

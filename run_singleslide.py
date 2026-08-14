@@ -4,7 +4,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent / "core"))
 from orchestrator import run_pipeline
 
-WEEK_OF = "2026-08-11"
+WEEK_OF = "2026-08-14"
 REPORTS_DIR = "reports/singleslide"
 
 
